@@ -1,14 +1,12 @@
-use futures_util::sink::SinkExt;
+use futures_util::SinkExt;
 use parity_scale_codec::{Decode, Encode};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Encode, Decode)]
 struct HandshakeMessage {
@@ -36,17 +34,19 @@ async fn perform_handshake(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let genesis_hash_vec =
         hex::decode("5972ecbfbc42507482dbcb0a2892bcd70161fd9acdfdf7e6455ab39bac3dfb83")?;
-    let genesis_hash: [u8; 32] = match genesis_hash_vec.try_into() {
-        Ok(hash) => hash,
-        Err(_) => return Err("Invalid length for genesis hash".into()),
-    };
+    let genesis_hash: [u8; 32] = genesis_hash_vec
+        .try_into()
+        .expect("Invalid length for genesis hash");
 
     let capabilities = vec!["full".to_string()];
 
     let handshake_msg = HandshakeMessage::new("my-node", "my-chain", genesis_hash, capabilities);
     let encoded_msg = handshake_msg.encode();
 
+    // Acquire the lock to get the WebSocketStream
     let mut ws_stream = ws_stream.lock().await;
+
+    // Use the WebSocketStream directly to send the message
     ws_stream.send(Message::Binary(encoded_msg)).await?;
 
     if let Some(msg) = ws_stream.next().await {
@@ -87,13 +87,15 @@ async fn query_node_info(
         }),
     ];
 
+    // Acquire the lock to get the WebSocketStream
+    let mut ws_stream = ws_stream.lock().await;
+
     // Send each request and wait for the response
     for request in requests {
-        {
-            let mut ws_stream = ws_stream.lock().await;
-            ws_stream.send(Message::Text(request.to_string())).await?;
-        }
-        if let Some(msg) = ws_stream.lock().await.next().await {
+        // Use the WebSocketStream directly to send the message
+        ws_stream.send(Message::Text(request.to_string())).await?;
+
+        if let Some(msg) = ws_stream.next().await {
             let msg = msg?;
             if let Message::Text(response) = msg {
                 let response: serde_json::Value = serde_json::from_str(&response)?;
@@ -120,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     perform_handshake(ws_stream.clone()).await?;
     println!("Handshake completed!");
 
-    query_node_info(ws_stream).await?;
+    query_node_info(ws_stream.clone()).await?;
     println!("Node information queried!");
 
     Ok(())
