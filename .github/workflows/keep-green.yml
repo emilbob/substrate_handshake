@@ -1,0 +1,50 @@
+name: keep-green
+
+# Monthly health check: does this project still build and pass its tests?
+# A failed scheduled run emails the repo owner — silent rot becomes a signal.
+on:
+  schedule:
+    - cron: "0 6 5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build & test (auto-detected toolchain)
+        run: |
+          set -e
+          ran=0
+          if [ -f package.json ]; then
+            ran=1
+            PM=npm
+            if [ -f pnpm-lock.yaml ]; then
+              PM=pnpm; command -v pnpm >/dev/null || npm i -g pnpm
+              pnpm install --frozen-lockfile
+            elif [ -f yarn.lock ]; then
+              PM=yarn; command -v yarn >/dev/null || npm i -g yarn
+              yarn install --frozen-lockfile
+            elif [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+            if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)"; then $PM run build; fi
+            if node -e "process.exit((require('./package.json').scripts||{}).test?0:1)"; then $PM run test; fi
+          fi
+          ct=$(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' | head -1)
+          if [ -n "$ct" ]; then
+            ran=1
+            cd "$(dirname "$ct")"
+            cargo build
+            cargo test
+            cd - >/dev/null
+          fi
+          if [ "$ran" = 0 ]; then echo "No recognized toolchain — nothing to check."; fi
