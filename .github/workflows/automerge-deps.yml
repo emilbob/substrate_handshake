@@ -1,0 +1,38 @@
+name: automerge-deps
+
+# Auto-merges Dependabot's GROUPED patch/minor PRs after keep-green passes on
+# the PR (workflow_run = base-branch code + write token; never executes PR code
+# with credentials). Majors are config-ignored; anything else stays human.
+on:
+  workflow_run:
+    workflows: ["keep-green"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ toJson(github.event.workflow_run.pull_requests) }}
+        run: |
+          echo "$PRS" | python3 -c "import json,sys; [print(p['number']) for p in json.load(sys.stdin)]" | while read -r n; do
+            [ -z "$n" ] && continue
+            author=$(gh pr view "$n" --repo "$GITHUB_REPOSITORY" --json author --jq .author.login)
+            title=$(gh pr view "$n" --repo "$GITHUB_REPOSITORY" --json title --jq .title)
+            if [ "$author" != "app/dependabot" ] && [ "$author" != "dependabot[bot]" ]; then
+              echo "PR #$n author=$author — not dependabot, skipping"; continue
+            fi
+            case "$title" in
+              *minor-and-patch*)
+                gh pr merge "$n" --repo "$GITHUB_REPOSITORY" --squash --delete-branch \
+                  && echo "auto-merged #$n (grouped patch/minor, CI green)" ;;
+              *)
+                echo "PR #$n is not a grouped patch/minor bump — left for human review" ;;
+            esac
+          done
