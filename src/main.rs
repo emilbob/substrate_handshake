@@ -131,7 +131,7 @@ struct NodeInfo {
 /// speaks JSON-RPC over text frames and has no notion of this struct; the real
 /// peer handshake is a libp2p protocol on the p2p port (30333 by default),
 /// which requires Noise, multistream-select and yamux to reach. Chain identity
-/// is instead verified over RPC — see [`check_genesis_hash`].
+/// is instead verified over RPC — see [`verify_genesis_hash`].
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
 struct HandshakeMessage {
     version: u32,
@@ -537,6 +537,64 @@ fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Err
     })
 }
 
+/// Decides whether the node meets the requirements the caller set.
+///
+/// This is what makes the exit code mean "the node is usable" rather than
+/// merely "the node answered". Takes the filled-in report rather than the raw
+/// query result, so that the findings are always recorded before they are
+/// judged — a failed requirement must still leave a complete report behind.
+///
+/// A requirement that cannot be evaluated is a failure, not a pass: if the node
+/// would not say how many peers it has, `--require-peers` has not been met, and
+/// treating silence as success is how a probe comes to certify a broken node.
+///
+/// # Arguments
+///
+/// * `report` - What the probe found.
+/// * `min_peers` - The minimum connected peers required, if any.
+/// * `require_synced` - Whether a syncing node should be rejected.
+///
+/// # Returns
+///
+/// A Result that is an error naming the first requirement the node failed.
+fn check_requirements(
+    report: &ProbeReport,
+    min_peers: Option<u64>,
+    require_synced: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(min) = min_peers {
+        match report.peers {
+            Some(peers) if peers < min => {
+                return Err(
+                    format!("node has {peers} peer(s), --require-peers demands {min}").into(),
+                )
+            }
+            None => {
+                return Err(
+                    "node did not report a peer count, so --require-peers cannot be satisfied"
+                        .into(),
+                )
+            }
+            Some(peers) => info!("Peer requirement met: {peers} >= {min}"),
+        }
+    }
+
+    if require_synced {
+        match report.is_syncing {
+            Some(true) => return Err("node is still syncing".into()),
+            None => {
+                return Err(
+                    "node did not report its sync state, so --require-synced cannot be satisfied"
+                        .into(),
+                )
+            }
+            Some(false) => info!("Sync requirement met: node is not syncing"),
+        }
+    }
+
+    Ok(())
+}
+
 /// Connect to a Substrate node, verify which chain it serves, and query its
 /// identity over JSON-RPC.
 #[derive(Parser, Debug)]
@@ -556,6 +614,17 @@ struct Opt {
     /// them, then unsubscribe and exit. Omit to exit straight after the query.
     #[arg(long, value_name = "COUNT")]
     follow: Option<u64>,
+
+    /// Fail unless the node reports at least this many connected peers. A node
+    /// can answer every query correctly and still be useless because it is
+    /// talking to nobody.
+    #[arg(long, value_name = "N")]
+    require_peers: Option<u64>,
+
+    /// Fail if the node is still syncing. A syncing node serves stale state,
+    /// which is worse than an unreachable one because it looks fine.
+    #[arg(long)]
+    require_synced: bool,
 
     /// Print the findings to stdout as a single JSON object. Logs stay on
     /// stderr, so stdout carries nothing but the report and can be piped
@@ -618,6 +687,11 @@ async fn run(
     report.is_syncing = info.is_syncing;
     report.should_have_peers = info.should_have_peers;
     info!("Node information queried!");
+
+    // Judged before `--follow`, which can block for as long as the chain takes
+    // to produce a block: there is no sense watching heads on a node that has
+    // already failed the bar the caller set.
+    check_requirements(report, opt.require_peers, opt.require_synced)?;
 
     if let Some(count) = opt.follow {
         report.heads_followed = Some(follow_new_heads(&mut ws_stream, count, timeouts).await?);
@@ -1076,6 +1150,65 @@ mod tests {
         );
     }
 
+    /// Builds a report as if the node had answered with this health.
+    fn report_with_health(peers: Option<u64>, is_syncing: Option<bool>) -> ProbeReport {
+        ProbeReport {
+            peers,
+            is_syncing,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_requirement_accepts_enough_peers() {
+        let report = report_with_health(Some(5), Some(false));
+        assert!(
+            check_requirements(&report, Some(5), false).is_ok(),
+            "at bar"
+        );
+        assert!(check_requirements(&report, Some(4), false).is_ok(), "above");
+        assert!(check_requirements(&report, None, false).is_ok(), "no bar");
+    }
+
+    #[test]
+    fn peer_requirement_rejects_an_isolated_node() {
+        let report = report_with_health(Some(0), Some(false));
+        let err = check_requirements(&report, Some(1), false)
+            .expect_err("a node with no peers must not pass")
+            .to_string();
+        assert!(err.contains("0 peer(s)"), "unhelpful error: {err}");
+    }
+
+    /// The trap this whole flag exists to avoid: a node that will not say how
+    /// many peers it has has not proven it has any.
+    #[test]
+    fn unreported_peer_count_fails_the_requirement() {
+        let report = report_with_health(None, Some(false));
+        assert!(
+            check_requirements(&report, Some(1), false).is_err(),
+            "silence must not be read as success"
+        );
+    }
+
+    #[test]
+    fn sync_requirement_rejects_a_syncing_node() {
+        let syncing = report_with_health(Some(50), Some(true));
+        assert!(check_requirements(&syncing, None, true).is_err());
+        assert!(
+            check_requirements(&syncing, None, false).is_ok(),
+            "syncing is only a failure when --require-synced was asked for"
+        );
+
+        let synced = report_with_health(Some(50), Some(false));
+        assert!(check_requirements(&synced, None, true).is_ok());
+    }
+
+    #[test]
+    fn unreported_sync_state_fails_the_requirement() {
+        let report = report_with_health(Some(50), None);
+        assert!(check_requirements(&report, None, true).is_err());
+    }
+
     /// A failed run must still produce a report, or whatever is parsing stdout
     /// gets nothing exactly when the node is broken.
     #[test]
@@ -1092,5 +1225,61 @@ mod tests {
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"], "genesis hash mismatch");
         assert_eq!(json["endpoint"], "ws://127.0.0.1:9944");
+    }
+
+    const POLKADOT_GENESIS: &str =
+        "91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3";
+
+    /// The whole probe against the real Polkadot network — the one check the
+    /// mock node cannot make. The mock answers whatever this file tells it to,
+    /// so it can only prove the client is self-consistent; it would keep passing
+    /// if a method were renamed, a result shape changed, or the `wss://` and
+    /// rustls path broke. Ignored by default because it needs the network and
+    /// depends on a third party being up:
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture
+    /// ```
+    ///
+    /// Run on a schedule by `.github/workflows/live-probe.yml`, never on a PR.
+    #[tokio::test]
+    #[ignore = "hits the live Polkadot network; run with `cargo test -- --ignored`"]
+    async fn live_polkadot_endpoint_passes_every_check() {
+        // Another test in the process may have installed it already; only a
+        // genuine absence would matter, and that surfaces as a panic below.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let opt = Opt {
+            node_address: "wss://rpc.polkadot.io".to_string(),
+            genesis_hash: Some(POLKADOT_GENESIS.to_string()),
+            follow: Some(1),
+            require_peers: Some(1),
+            require_synced: true,
+            json: false,
+        };
+
+        let mut report = ProbeReport {
+            endpoint: opt.node_address.clone(),
+            ..Default::default()
+        };
+        let result = run(&opt, Timeouts::default(), &mut report).await;
+
+        assert!(
+            result.is_ok(),
+            "live probe failed: {:?}\nreport: {report:#?}",
+            result.err()
+        );
+        assert!(report.genesis_verified, "genesis should have been enforced");
+        assert_eq!(report.chain.as_deref(), Some("Polkadot"));
+        assert!(report.name.is_some(), "system_name went unanswered");
+        assert!(report.version.is_some(), "system_version went unanswered");
+        // The reason this test exists in its current form: system_health is the
+        // newest call here and the one most likely to drift.
+        assert!(
+            report.peers.unwrap_or(0) > 0,
+            "system_health reported no peers: {report:#?}"
+        );
+        assert_eq!(report.is_syncing, Some(false));
+        assert_eq!(report.heads_followed, Some(1), "no header was pushed");
     }
 }

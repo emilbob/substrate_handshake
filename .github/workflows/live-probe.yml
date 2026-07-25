@@ -1,0 +1,47 @@
+name: live-probe
+
+# Runs the probe against the real Polkadot network, which the mock-node tests
+# cannot do: they answer whatever the test file tells them to, so they would
+# keep passing if an RPC method were renamed, a result shape changed, or the
+# wss:// + rustls path broke.
+#
+# Deliberately separate from keep-green and never run on a pull request: this
+# depends on a third party being up, and a PR that fails because someone else's
+# endpoint blinked is exactly the false alarm that teaches you to ignore CI.
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Retried rather than reported on the first failure: one dropped
+      # connection is noise, three in a row is a signal. The build is cached
+      # after the first attempt, so a retry costs only the probe itself.
+      - name: Probe the live Polkadot network
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test -- --ignored --nocapture; then
+              exit 0
+            fi
+            echo "::warning::live probe attempt $attempt failed"
+            [ "$attempt" != 3 ] && sleep 30
+          done
+          echo "::error::live probe failed 3 times — the endpoint is down or the client has drifted"
+          exit 1

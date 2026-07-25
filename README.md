@@ -90,14 +90,29 @@ cargo run -- [--node-address <url>] [--genesis-hash <hex>]
 | `--node-address` | `ws://127.0.0.1:9944` | WebSocket RPC endpoint. `wss://` is supported. |
 | `--genesis-hash` | *(none)* | Hash the node must report, with or without a `0x` prefix. Omit to report the node's genesis hash without enforcing one. |
 | `--follow <COUNT>` | *(none)* | Follow this many new block headers after querying, then unsubscribe and exit. Omit to exit straight after the query. |
+| `--require-peers <N>` | *(none)* | Fail unless the node reports at least `N` connected peers. |
+| `--require-synced` | *(off)* | Fail if the node is still syncing. |
 | `--json` | *(off)* | Print the findings to stdout as one JSON object. Logs stay on stderr. |
 
-Exit code is `0` on success and `1` on any failure, including a genesis mismatch, so it is usable as a health check in scripts:
+Exit code is `0` on success and `1` on any failure, so it works as a health check directly:
 
 ```bash
-substrate-node-probe --node-address wss://rpc.polkadot.io --json 2>/dev/null \
-  | jq -e '.ok and .peers > 0 and (.is_syncing | not)'
+substrate-node-probe --node-address wss://rpc.polkadot.io \
+  --require-peers 1 --require-synced || alert "polkadot rpc is unusable"
 ```
+
+### Requirements
+
+Without `--require-*` the exit code only means *the node answered*. A node can answer every query correctly, on the right chain, and still be useless — connected to nobody, or serving stale state while it catches up. The flags are what make the exit code mean *the node is usable*:
+
+```
+ERROR node has 0 peer(s), --require-peers demands 1
+ERROR node is still syncing
+```
+
+A requirement that **cannot be evaluated fails**. If the node will not say how many peers it has — `system_health` is not exposed everywhere — then `--require-peers` has not been met, and the probe says so rather than passing. Treating silence as success is how a health check comes to certify a broken node.
+
+Requirements are judged before `--follow`, so a node that has already failed is not watched for another block.
 
 ### Public endpoints
 
@@ -138,11 +153,18 @@ A dev chain's genesis hash depends on its chainspec and runtime build, so there 
 
 ```bash
 cargo test                      # unit tests, incl. mock-node integration
+cargo test -- --ignored         # plus the live-network probe (see below)
 cargo clippy --all-targets      # lints
 cargo fmt --check               # formatting
 ```
 
 Tests run against an in-process mock WebSocket node, so they need no network and no running Substrate node. Timeouts are injectable, so the timeout paths are covered with short real durations and the whole suite finishes in well under a second.
+
+### The live test
+
+The mock node answers whatever the test file tells it to, so it can only prove the client is self-consistent — it would keep passing if an RPC method were renamed, a result shape changed, or the `wss://` and rustls path broke. One `#[ignore]`d test runs the whole probe against `wss://rpc.polkadot.io` and asserts on the real answers.
+
+It is excluded from `cargo test` and never runs on a pull request, because it depends on a third party being up: a PR failing because someone else's endpoint blinked is the false alarm that teaches you to ignore CI. [`live-probe.yml`](.github/workflows/live-probe.yml) runs it weekly instead, retrying twice before reporting — one dropped connection is noise, three in a row is a signal.
 
 ## Notes
 
