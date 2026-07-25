@@ -60,17 +60,25 @@ jobs:
             ran=1
             cd "$(dirname "$ct")"
             cargo fmt --check
-            # Clippy blocks on PRs, where new warnings mean new code. On the
-            # scheduled run it only reports: a future toolchain adding a lint
-            # would otherwise fail the health check on untouched code, which is
-            # exactly the false alarm that trains you to ignore it.
+            # --all-features throughout: optional features are exactly the code
+            # nobody compiles locally, so without this the server binary rots
+            # unnoticed while the default build stays green.
             if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-              cargo clippy --all-targets -- -D warnings
+              cargo clippy --all-targets --all-features -- -D warnings
             else
-              cargo clippy --all-targets || echo "::warning::clippy reported warnings (non-blocking on a scheduled run)"
+              # Clippy only reports on the scheduled run: a future toolchain
+              # adding a lint would otherwise fail the health check on untouched
+              # code, the false alarm that trains you to ignore it.
+              cargo clippy --all-targets --all-features || echo "::warning::clippy reported warnings (non-blocking on a scheduled run)"
             fi
-            cargo build
-            cargo test
+            cargo build --all-features
+            cargo test --all-features
             cd - >/dev/null
           fi
           if [ "$ran" = 0 ]; then echo "No recognized toolchain — nothing to check."; fi
+
+      # A broken Dockerfile only shows up as a failed deploy otherwise, by which
+      # point it is already on the default branch.
+      - name: Build the container image
+        if: hashFiles('Dockerfile') != ''
+        run: docker build -t ${{ github.event.repository.name }}:ci .

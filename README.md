@@ -106,29 +106,64 @@ The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE enc
 
 **→ [emilbob.github.io/substrate-node-probe](https://emilbob.github.io/substrate-node-probe/)**
 
-The same checks against a live node, with results filling in as they resolve. It is a **JavaScript reimplementation**, not this binary — a browser cannot execute a Rust program — but it speaks the same JSON-RPC, uses the same request ids and failure kinds, and applies the same rule that an unprovable requirement fails rather than passes. Connections go straight from your browser to the node you name; nothing is proxied.
+The same checks against a live node, with results filling in as they resolve. Source is [`web/index.html`](web/index.html) — one self-contained file, no build step.
 
-Source is [`web/index.html`](web/index.html), one self-contained file with no build step. To run it locally:
+The page runs the checks one of two ways, and always says which:
+
+| Engine | When | What actually runs |
+| --- | --- | --- |
+| **JavaScript** | Static hosting, e.g. GitHub Pages | A reimplementation of the checks in the browser tab, connecting straight to the node. Nothing is proxied. |
+| **Rust** | Served by `serve` (see below) | The real binary, server-side. The report is its output, unmodified. |
+
+The page asks `/api/health` on load; if a backend answers, it offers the switch and defaults to Rust. On a static host there is nothing to switch to, so it stays in browser mode and says so rather than implying the binary ran.
+
+The JavaScript engine is a genuine reimplementation, not a shim — same request ids, same pipelined calls, same per-step deadlines, same eight failure kinds, same rule that an unprovable requirement fails. It exists so the page is useful without a server, not to pretend to be the binary.
+
+Locally, either way:
 
 ```bash
-python3 -m http.server -d web 8000    # then open http://127.0.0.1:8000
+python3 -m http.server -d web 8000              # static, JavaScript engine only
+cargo run --features server --bin serve         # http://127.0.0.1:8080, both engines
 ```
 
-Deployed by [`pages.yml`](.github/workflows/pages.yml) on any push that touches `web/`.
+Note that a page served over `https` cannot open a `ws://` connection to `127.0.0.1` — browsers block that as mixed content — so probing a **local dev node** from the hosted page is not possible. Use the CLI, which has no such restriction.
 
-A page served over `https` cannot open a `ws://` connection to `127.0.0.1` — browsers block that as mixed content — so probing a **local dev node** means running the page from disk or `http://127.0.0.1`, or just using the CLI, which has no such restriction.
+## Hosting the real binary
+
+[`serve`](src/bin/serve.rs) is a small HTTP wrapper around the same `probe()` the CLI calls: `GET /api/health`, `POST /api/probe`, and the static page on everything else so the two share an origin.
+
+```bash
+cargo run --features server --bin serve
+curl -s localhost:8080/api/probe -H 'Content-Type: application/json' \
+  -d '{"endpoint":"wss://rpc.polkadot.io","require_peers":1}' | jq
+```
+
+It is feature-gated, so a plain `cargo build` still produces only the CLI without compiling a web stack it will never call.
+
+[`render.yaml`](render.yaml) provisions it on [Render](https://render.com) from the [`Dockerfile`](Dockerfile) — *New → Blueprint → pick this repo*. On Render's free tier the service sleeps after ~15 minutes idle, so the first request after a quiet spell is slow.
+
+### Running it for strangers is not running it for yourself
+
+An endpoint field that becomes an outbound connection is server-side request forgery. [`guard.rs`](src/guard.rs) resolves the host and refuses anything that is not on the public internet — loopback, RFC1918, link-local (`169.254.169.254` is where cloud metadata lives), carrier-grade NAT, multicast, and the IPv4-mapped IPv6 forms of all of them. The server also caps `follow`, shortens the header wait, limits the request body and bounds the whole request.
+
+**None of this applies to the CLI**, which defaults to `ws://127.0.0.1:9944` and must keep working against a local dev node. The difference is not the address, it's who is asking.
+
+One limit worth stating plainly: the guard resolves the name and the WebSocket client resolves it again, so a record that changes in between could still slip past (DNS rebinding). Closing that needs the connection pinned to the address already checked, which the client does not expose. The service therefore also holds no secrets and has nothing worth reaching.
 
 ## Layout
 
 | File | Holds |
 | --- | --- |
-| `src/main.rs` | The CLI flags, and the order the steps run in. |
+| `src/lib.rs` | The probe itself, so the CLI and the server run the same code. |
+| `src/main.rs` | The CLI flags. |
+| `src/bin/serve.rs` | The HTTP wrapper, and the limits that apply only to strangers. |
 | `src/rpc.rs` | The transport: opening the WebSocket, request ids, timeouts, reading frames. Knows nothing about chains. |
 | `src/probe.rs` | The JSON-RPC calls — genesis hash, identity, health and height, following heads. |
 | `src/report.rs` | The findings, their JSON shape, and the `--require-*` checks. |
 | `src/error.rs` | The failure taxonomy. |
+| `src/guard.rs` | The SSRF check. Used by the server only, never the CLI. |
 | `src/scale.rs` | The SCALE codec example. |
-| `web/index.html` | The browser version — same checks, different language. |
+| `web/index.html` | The browser page, and the JavaScript engine. |
 
 ## Requirements
 

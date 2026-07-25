@@ -12,7 +12,7 @@ use parity_scale_codec::{Decode, Encode};
 /// which requires Noise, multistream-select and yamux to reach. Chain identity
 /// is instead verified over RPC — see [`crate::probe::verify_genesis_hash`].
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct HandshakeMessage {
+pub struct HandshakeMessage {
     version: u32,
     name: String,
     chain: String,
@@ -34,12 +34,7 @@ impl HandshakeMessage {
     ///
     /// A HandshakeMessage instance.
     #[allow(dead_code)]
-    pub(crate) fn new(
-        name: &str,
-        chain: &str,
-        genesis_hash: [u8; 32],
-        capabilities: Vec<String>,
-    ) -> Self {
+    pub fn new(name: &str, chain: &str, genesis_hash: [u8; 32], capabilities: Vec<String>) -> Self {
         HandshakeMessage {
             version: 1,
             name: name.to_string(),

@@ -13,52 +13,52 @@ use crate::error::{Failure, ProbeError};
 /// The report is filled in as the run progresses and is printed even when the
 /// run fails, because a monitor wants to know how far the probe got.
 #[derive(Debug, Default, Serialize)]
-pub(crate) struct ProbeReport {
+pub struct ProbeReport {
     /// The endpoint that was probed.
-    pub(crate) endpoint: String,
+    pub endpoint: String,
     /// Whether every step succeeded. `false` means `error` is set.
-    pub(crate) ok: bool,
+    pub ok: bool,
     /// What kind of thing went wrong, for a consumer that needs to branch.
     /// `error` below says the same thing in prose and is free to be reworded;
     /// this is the part that is safe to alert on.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) failure: Option<Failure>,
+    pub failure: Option<Failure>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
+    pub error: Option<String>,
     /// The genesis hash the node reported, `0x`-prefixed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) genesis_hash: Option<String>,
+    pub genesis_hash: Option<String>,
     /// True only when `--genesis-hash` was supplied *and* matched. Without the
     /// flag the hash above is reported but nothing is proven about it.
-    pub(crate) genesis_verified: bool,
+    pub genesis_verified: bool,
     /// Round-trip time of the `chain_getBlockHash` call — one honest latency
     /// sample, taken before the pipelined queries muddy the measurement.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) rpc_latency_ms: Option<u128>,
+    pub rpc_latency_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) chain: Option<String>,
+    pub chain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) version: Option<String>,
+    pub version: Option<String>,
     /// Connected peers, from `system_health`. Zero on a live network means the
     /// node is isolated, which is the failure this probe exists to catch.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) peers: Option<u64>,
+    pub peers: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) is_syncing: Option<bool>,
+    pub is_syncing: Option<bool>,
     /// False for a dev chain running alone, which is why `peers: 0` is only
     /// alarming when this is true.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) should_have_peers: Option<bool>,
+    pub should_have_peers: Option<bool>,
     /// The node's best block number. Compare it across runs, or against another
     /// node, to tell a stuck node from a healthy one — the header carries no
     /// timestamp, so the probe cannot judge staleness on its own.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) best_block: Option<u64>,
+    pub best_block: Option<u64>,
     /// How many headers `--follow` observed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) heads_followed: Option<u64>,
+    pub heads_followed: Option<u64>,
 }
 
 /// Decides whether the node meets the requirements the caller set.
@@ -81,7 +81,7 @@ pub(crate) struct ProbeReport {
 /// # Returns
 ///
 /// A Result that is an error naming the first requirement the node failed.
-pub(crate) fn check_requirements(
+pub fn check_requirements(
     report: &ProbeReport,
     min_peers: Option<u64>,
     require_synced: bool,

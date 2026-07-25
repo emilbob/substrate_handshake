@@ -6,10 +6,34 @@ description = "Connects to a Substrate node over WebSocket, verifies which chain
 license = "MIT"
 repository = "https://github.com/emilbob/substrate-node-probe"
 
+[[bin]]
+name = "substrate-node-probe"
+path = "src/main.rs"
+
+# The HTTP wrapper behind the hosted page. Feature-gated so a plain
+# `cargo build` still produces just the CLI without compiling a web stack it
+# will never call.
+[[bin]]
+name = "serve"
+path = "src/bin/serve.rs"
+required-features = ["server"]
+
+[features]
+default = []
+server = ["dep:axum", "dep:tower-http"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+url = "2"
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = [
+  "fs",
+  "cors",
+  "limit",
+  "timeout",
+], optional = true }
 hex = "0.4"
 # rustls rather than native-tls: no OpenSSL system dependency, so the build is
 # self-contained on CI. Without a TLS feature every wss:// endpoint is

@@ -19,26 +19,26 @@ use crate::rpc::{
 
 /// What asking the node for block 0 produced.
 #[derive(Debug)]
-pub(crate) struct GenesisInfo {
+pub struct GenesisInfo {
     /// The hash the node reported.
-    pub(crate) hash: [u8; 32],
+    pub hash: [u8; 32],
     /// How long the node took to answer.
-    pub(crate) latency: Duration,
+    pub latency: Duration,
 }
 
 /// What the node said about itself. Every field is optional: a node may reject
 /// any single call — `system_health` in particular is not universally exposed —
 /// and one refused query should not sink the whole probe.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct NodeInfo {
-    pub(crate) name: Option<String>,
-    pub(crate) chain: Option<String>,
-    pub(crate) version: Option<String>,
-    pub(crate) peers: Option<u64>,
-    pub(crate) is_syncing: Option<bool>,
-    pub(crate) should_have_peers: Option<bool>,
+pub struct NodeInfo {
+    pub name: Option<String>,
+    pub chain: Option<String>,
+    pub version: Option<String>,
+    pub peers: Option<u64>,
+    pub is_syncing: Option<bool>,
+    pub should_have_peers: Option<bool>,
     /// The number of the node's best block, from `chain_getHeader`.
-    pub(crate) best_block: Option<u64>,
+    pub best_block: Option<u64>,
 }
 
 /// Parses a hex-encoded 32-byte genesis hash.
@@ -52,7 +52,7 @@ pub(crate) struct NodeInfo {
 /// The decoded hash, or a message explaining why the input was rejected. The
 /// caller classifies it, because the same bad value means different things
 /// coming from the command line and coming from the node.
-pub(crate) fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], String> {
+pub fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], String> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(hex_str).map_err(|e| format!("genesis hash is not valid hex: {e}"))?;
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
@@ -85,7 +85,7 @@ fn parse_block_number(header: &serde_json::Value) -> Option<u64> {
 /// # Returns
 ///
 /// The hash the node reported and how long it took to answer.
-pub(crate) async fn fetch_genesis_hash(
+pub async fn fetch_genesis_hash(
     ws_stream: &mut NodeStream,
     timeouts: Timeouts,
 ) -> Result<GenesisInfo, ProbeError> {
@@ -149,7 +149,7 @@ pub(crate) async fn fetch_genesis_hash(
 ///
 /// Whether the hash was actually checked; `false` means no requirement was
 /// supplied and nothing has been proven. An error if the two differ.
-pub(crate) fn verify_genesis_hash(
+pub fn verify_genesis_hash(
     reported: [u8; 32],
     expected: Option<&[u8; 32]>,
 ) -> Result<bool, ProbeError> {
@@ -191,7 +191,7 @@ pub(crate) fn verify_genesis_hash(
 /// What the node reported. A call the node refuses leaves its field empty
 /// rather than failing the probe; only a node that stops answering entirely is
 /// an error.
-pub(crate) async fn query_node_info(
+pub async fn query_node_info(
     ws_stream: &mut NodeStream,
     timeouts: Timeouts,
 ) -> Result<NodeInfo, ProbeError> {
@@ -338,7 +338,7 @@ fn record_response(info: &mut NodeInfo, id: u64, result: &serde_json::Value) {
 ///
 /// How many headers were observed, or an error if the node refuses the
 /// subscription or stops producing blocks.
-pub(crate) async fn follow_new_heads(
+pub async fn follow_new_heads(
     ws_stream: &mut NodeStream,
     count: u64,
     timeouts: Timeouts,

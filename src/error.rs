@@ -17,7 +17,7 @@ use std::fmt;
 /// matching on error text that is free to be reworded at any time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Failure {
+pub enum Failure {
     /// The command line asked for something impossible; the node is blameless.
     Config,
     /// The connection was never established.
@@ -39,44 +39,44 @@ pub(crate) enum Failure {
 
 /// A failure, classified.
 #[derive(Debug)]
-pub(crate) struct ProbeError {
+pub struct ProbeError {
     kind: Failure,
     message: String,
 }
 
 impl ProbeError {
-    pub(crate) fn new(kind: Failure, message: impl Into<String>) -> Self {
+    pub fn new(kind: Failure, message: impl Into<String>) -> Self {
         ProbeError {
             kind,
             message: message.into(),
         }
     }
 
-    pub(crate) fn config(message: impl Into<String>) -> Self {
+    pub fn config(message: impl Into<String>) -> Self {
         Self::new(Failure::Config, message)
     }
 
-    pub(crate) fn connect(message: impl Into<String>) -> Self {
+    pub fn connect(message: impl Into<String>) -> Self {
         Self::new(Failure::Connect, message)
     }
 
-    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+    pub fn timeout(message: impl Into<String>) -> Self {
         Self::new(Failure::Timeout, message)
     }
 
-    pub(crate) fn transport(message: impl Into<String>) -> Self {
+    pub fn transport(message: impl Into<String>) -> Self {
         Self::new(Failure::Transport, message)
     }
 
-    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+    pub fn protocol(message: impl Into<String>) -> Self {
         Self::new(Failure::Protocol, message)
     }
 
-    pub(crate) fn rpc(message: impl Into<String>) -> Self {
+    pub fn rpc(message: impl Into<String>) -> Self {
         Self::new(Failure::RpcError, message)
     }
 
-    pub(crate) fn kind(&self) -> Failure {
+    pub fn kind(&self) -> Failure {
         self.kind
     }
 
@@ -85,7 +85,7 @@ impl ProbeError {
     /// Used where an inner step already knows *what* went wrong and the outer
     /// step knows *how far it had got* — a timeout is still a timeout when you
     /// note it happened on the second of three headers.
-    pub(crate) fn context(mut self, extra: impl AsRef<str>) -> Self {
+    pub fn context(mut self, extra: impl AsRef<str>) -> Self {
         self.message = format!("{} {}", self.message, extra.as_ref());
         self
     }
