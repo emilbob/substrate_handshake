@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>substrate-node-probe — live</title>
+<meta name="description" content="Run the substrate-node-probe checks against a live Substrate node from your browser.">
+<style>
+  :root {
+    --ground: #F7F5F1;
+    --panel: #FFFFFF;
+    --panel-2: #EFEBE4;
+    --ink: #16191F;
+    --ink-2: #434B57;
+    --muted: #6E7887;
+    --rule: #DAD5CC;
+    --rule-strong: #C2BCB0;
+    --accent: #8F5D0E;
+    --accent-soft: #F0E2C6;
+    --pass: #1F7A67;
+    --pass-soft: #DDEDE8;
+    --fail: #A8412A;
+    --fail-soft: #F5E1DB;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --serif: "Iowan Old Style", "Charter", "Palatino Linotype", Palatino, Georgia, serif;
+
+    --step--1: 0.79rem;
+    --step-0: 1rem;
+    --step-1: 1.28rem;
+    --step-2: 1.75rem;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #12161C; --panel: #181D25; --panel-2: #1F252F;
+      --ink: #E8E6E1; --ink-2: #B4BAC4; --muted: #7A8492;
+      --rule: #2A313C; --rule-strong: #3A424F;
+      --accent: #E0A030; --accent-soft: #33291A;
+      --pass: #3FA894; --pass-soft: #16302C;
+      --fail: #D0674B; --fail-soft: #33201A;
+    }
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: var(--step-0);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page { max-width: 62rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2.5rem) 5rem; }
+
+  .label {
+    font-family: var(--mono); font-size: var(--step--1);
+    text-transform: uppercase; letter-spacing: 0.13em;
+    color: var(--muted); font-weight: 600;
+  }
+
+  header.masthead {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 2rem;
+    align-items: baseline; justify-content: space-between;
+    padding: 2.25rem 0 1rem; border-bottom: 1px solid var(--rule);
+  }
+
+  header.masthead h1 {
+    font-family: var(--mono); font-size: var(--step-2); font-weight: 600;
+    letter-spacing: -0.02em; margin: 0;
+  }
+
+  .disclosure {
+    margin: 1.5rem 0 0;
+    border-left: 2px solid var(--accent);
+    padding: 0.1rem 0 0.1rem 1rem;
+    color: var(--ink-2);
+    font-size: 0.95rem;
+    max-width: 68ch;
+  }
+
+  .disclosure strong { color: var(--ink); font-weight: 600; }
+
+  form.controls {
+    margin: 2rem 0 0;
+    border: 1px solid var(--rule-strong); border-radius: 3px;
+    background: var(--panel); overflow: hidden;
+  }
+
+  .controls-grid {
+    display: grid; gap: 1px; background: var(--rule);
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  }
+
+  .field { background: var(--panel); padding: 0.9rem 1rem; display: grid; gap: 0.45rem; align-content: start; }
+  .field.wide { grid-column: 1 / -1; }
+
+  label { display: block; }
+
+  input[type="text"], select {
+    font-family: var(--mono); font-size: 0.85rem;
+    padding: 0.5rem 0.6rem; width: 100%;
+    background: var(--ground); color: var(--ink);
+    border: 1px solid var(--rule-strong); border-radius: 2px;
+  }
+
+  input[type="text"]:focus-visible, select:focus-visible,
+  button:focus-visible, input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  .check { display: flex; align-items: center; gap: 0.55rem; font-family: var(--mono); font-size: 0.85rem; color: var(--ink-2); }
+  .check input { accent-color: var(--accent); width: 1rem; height: 1rem; }
+
+  .actions {
+    display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+    padding: 0.9rem 1rem; border-top: 1px solid var(--rule); background: var(--panel-2);
+  }
+
+  button {
+    font-family: var(--mono); font-size: 0.85rem; font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 0.55rem 1.1rem; border-radius: 2px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent);
+    color: var(--ground);
+  }
+
+  button.ghost { background: transparent; color: var(--ink-2); border-color: var(--rule-strong); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .elapsed { font-family: var(--mono); font-size: var(--step--1); color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+
+  /* verdict banner */
+  .verdict-bar {
+    margin-top: 1.5rem; border: 1px solid var(--rule-strong); border-radius: 3px;
+    padding: 1rem 1.15rem; background: var(--panel);
+    display: flex; flex-wrap: wrap; gap: 0.6rem 1.25rem; align-items: baseline;
+  }
+  .verdict-bar[data-state="pass"] { border-color: color-mix(in srgb, var(--pass) 45%, transparent); background: var(--pass-soft); }
+  .verdict-bar[data-state="fail"] { border-color: color-mix(in srgb, var(--fail) 45%, transparent); background: var(--fail-soft); }
+
+  .verdict-bar .headline { font-family: var(--mono); font-weight: 700; letter-spacing: 0.04em; font-size: 1rem; }
+  .verdict-bar[data-state="pass"] .headline { color: var(--pass); }
+  .verdict-bar[data-state="fail"] .headline { color: var(--fail); }
+  .verdict-bar[data-state="idle"] .headline,
+  .verdict-bar[data-state="running"] .headline { color: var(--muted); }
+  .verdict-bar .detail { color: var(--ink-2); font-size: 0.93rem; flex: 1 1 20rem; min-width: 0; overflow-wrap: anywhere; }
+
+  .kindchip {
+    font-family: var(--mono); font-size: var(--step--1); font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 0.22rem 0.5rem; border-radius: 2px;
+    color: var(--fail); border: 1px solid color-mix(in srgb, var(--fail) 40%, transparent);
+  }
+
+  /* checks */
+  .checks { margin-top: 1.5rem; border: 1px solid var(--rule-strong); border-radius: 3px; overflow: hidden; background: var(--rule); display: grid; gap: 1px; }
+
+  .checkrow {
+    background: var(--panel); padding: 0.8rem 1rem;
+    display: grid; grid-template-columns: 1.5rem 1fr auto; gap: 0.15rem 0.8rem;
+    align-items: baseline;
+  }
+
+  .checkrow .mark { font-family: var(--mono); font-weight: 700; font-size: 0.9rem; }
+  .checkrow[data-state="pending"] .mark { color: var(--muted); }
+  .checkrow[data-state="running"] .mark { color: var(--accent); }
+  .checkrow[data-state="pass"] .mark { color: var(--pass); }
+  .checkrow[data-state="fail"] .mark { color: var(--fail); }
+  .checkrow[data-state="skip"] { opacity: 0.5; }
+
+  .checkrow .name { font-family: var(--mono); font-size: 0.9rem; color: var(--ink); }
+  .checkrow .value { font-family: var(--mono); font-size: 0.85rem; color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .checkrow .note { grid-column: 2 / -1; font-size: 0.88rem; color: var(--muted); overflow-wrap: anywhere; }
+
+  /* heads feed */
+  .feed { margin-top: 1.5rem; border: 1px solid var(--rule-strong); border-radius: 3px; overflow: hidden; }
+  .feed-head { padding: 0.7rem 1rem; background: var(--panel-2); border-bottom: 1px solid var(--rule); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+  .feed-body { background: var(--panel); max-height: 14rem; overflow-y: auto; }
+  .feed-row { padding: 0.5rem 1rem; border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: 0.82rem; display: flex; justify-content: space-between; gap: 1rem; }
+  .feed-row:last-child { border-bottom: 0; }
+  .feed-row .num { color: var(--accent); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .feed-row .gap { color: var(--muted); }
+
+  /* json */
+  .report { margin-top: 1.5rem; border: 1px solid var(--rule-strong); border-radius: 3px; overflow: hidden; }
+  .report-head { padding: 0.7rem 1rem; background: var(--panel-2); border-bottom: 1px solid var(--rule); display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .report-body { background: var(--panel); overflow-x: auto; padding: 1rem; }
+  pre { margin: 0; font-family: var(--mono); font-size: 0.82rem; line-height: 1.65; color: var(--ink-2); white-space: pre; }
+
+  footer { margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--rule); }
+  footer p { margin: 0 0 0.5rem; font-family: var(--mono); font-size: var(--step--1); color: var(--muted); line-height: 1.6; max-width: 70ch; }
+  footer a { color: var(--accent); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .checkrow[data-state="running"] .mark { animation: pulse 1s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: 0.3; } }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <h1>substrate-node-probe</h1>
+    <span class="label">Live · in your browser</span>
+  </header>
+
+  <p class="disclosure">
+    <strong>This is not the Rust binary.</strong> A browser cannot execute it. What runs here is a
+    JavaScript reimplementation of the same checks, speaking the same JSON-RPC over the same
+    WebSocket — same request ids, same failure kinds, same rule that an unprovable requirement
+    fails rather than passes. The connection is made directly from your browser to the node you
+    name; nothing is proxied and no data leaves your machine.
+  </p>
+
+  <form class="controls" id="form">
+    <div class="controls-grid">
+      <div class="field wide">
+        <label class="label" for="preset">Chain</label>
+        <select id="preset">
+          <option value="polkadot">Polkadot — wss://rpc.polkadot.io</option>
+          <option value="kusama">Kusama — wss://kusama-rpc.polkadot.io</option>
+          <option value="westend">Westend — wss://westend-rpc.polkadot.io</option>
+          <option value="custom">Custom endpoint…</option>
+        </select>
+      </div>
+
+      <div class="field wide">
+        <label class="label" for="endpoint">Endpoint</label>
+        <input type="text" id="endpoint" value="wss://rpc.polkadot.io" spellcheck="false" autocomplete="off">
+      </div>
+
+      <div class="field wide">
+        <label class="label" for="genesis">Required genesis hash <span style="text-transform:none;letter-spacing:0">(blank = report only, prove nothing)</span></label>
+        <input type="text" id="genesis" spellcheck="false" autocomplete="off"
+               value="91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3">
+      </div>
+
+      <div class="field">
+        <label class="label" for="peers">Require peers</label>
+        <input type="text" id="peers" value="1" inputmode="numeric" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <label class="label" for="follow">Follow heads</label>
+        <input type="text" id="follow" value="3" inputmode="numeric" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <span class="label">Bars</span>
+        <span class="check"><input type="checkbox" id="synced" checked><label for="synced">must not be syncing</label></span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" id="run">Probe</button>
+      <button type="button" class="ghost" id="stop" disabled>Stop</button>
+      <span class="elapsed" id="elapsed"></span>
+    </div>
+  </form>
+
+  <div class="verdict-bar" id="verdict" data-state="idle">
+    <span class="headline" id="verdict-headline">Ready</span>
+    <span class="detail" id="verdict-detail">Pick a chain and press Probe. Every check runs against the live network.</span>
+  </div>
+
+  <div class="checks" id="checks"></div>
+
+  <div class="feed" id="feed" hidden>
+    <div class="feed-head">
+      <span class="label">New heads</span>
+      <span class="label" id="feed-count"></span>
+    </div>
+    <div class="feed-body" id="feed-body"></div>
+  </div>
+
+  <div class="report" id="report" hidden>
+    <div class="report-head">
+      <span class="label">Report — what the CLI would print to stdout</span>
+      <button type="button" class="ghost" id="copy">Copy</button>
+    </div>
+    <div class="report-body"><pre id="report-json"></pre></div>
+  </div>
+
+  <footer>
+    <p>
+      Source: <a href="https://github.com/emilbob/substrate-node-probe">github.com/emilbob/substrate-node-probe</a> — Rust, MIT.
+    </p>
+    <p>
+      Local nodes: a page served over https cannot open a ws:// connection to 127.0.0.1 — browsers
+      block that as mixed content. To probe a local dev node, open this file directly from disk, or
+      use the CLI, which has no such restriction.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+"use strict";
+
+/* Request ids, matching the Rust exactly: responses are correlated by id, and a
+   subscription must not reuse the id of an outstanding query. */
+const ID = { GENESIS: 0, NAME: 1, CHAIN: 2, VERSION: 3, HEALTH: 4, SUBSCRIBE: 5, UNSUBSCRIBE: 6, HEADER: 7 };
+
+const PRESETS = {
+  polkadot: { url: "wss://rpc.polkadot.io", genesis: "91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3" },
+  kusama:   { url: "wss://kusama-rpc.polkadot.io", genesis: "b0a8d493285c2df73290dfb7e61f870f17b41801197a149ca93654499ea3dafe" },
+  westend:  { url: "wss://westend-rpc.polkadot.io", genesis: "e143f23803ac50e8f6f8e62695d1ce9e4e1d68aa36c1cd2cfd15340213f3423e" },
+};
+
+const TIMEOUT = { connect: 10000, rpc: 10000, head: 120000 };
+
+/* --- errors, classified the same way the Rust classifies them --- */
+class ProbeError extends Error {
+  constructor(kind, message) { super(message); this.kind = kind; }
+}
+
+/* A budget for a whole step, not for one frame of it. The read loop skips frames
+   it does not recognise, so a per-frame clock would let a chattering node hold
+   the probe open forever — every wait short, the total unbounded. */
+function deadline(budgetMs) {
+  const at = performance.now() + budgetMs;
+  const expired = () => new ProbeError("timeout", `node sent no usable response within ${budgetMs / 1000}s`);
+  return {
+    remaining() {
+      const left = at - performance.now();
+      if (left <= 0) throw expired();
+      return left;
+    },
+    expired,
+  };
+}
+
+class NodeConn {
+  constructor(ws) {
+    this.ws = ws;
+    this.queue = [];
+    this.waiters = [];
+    this.closed = null;
+
+    ws.onmessage = (ev) => { if (typeof ev.data === "string") this.#deliver(ev.data); };
+    ws.onclose = () => { this.closed ||= new ProbeError("transport", "connection closed by the node"); this.#flush(); };
+    ws.onerror = () => { this.closed ||= new ProbeError("transport", "websocket error"); this.#flush(); };
+  }
+
+  #deliver(text) {
+    const w = this.waiters.shift();
+    if (w) w.resolve(text); else this.queue.push(text);
+  }
+
+  #flush() {
+    while (this.waiters.length) this.waiters.shift().reject(this.closed);
+  }
+
+  send(obj) { this.ws.send(JSON.stringify(obj)); }
+
+  nextText(dl) {
+    if (this.queue.length) return Promise.resolve(this.queue.shift());
+    if (this.closed) return Promise.reject(this.closed);
+
+    let remaining;
+    try { remaining = dl.remaining(); } catch (e) { return Promise.reject(e); }
+
+    return new Promise((resolve, reject) => {
+      const entry = {};
+      const timer = setTimeout(() => {
+        const i = this.waiters.indexOf(entry);
+        if (i >= 0) this.waiters.splice(i, 1);
+        reject(dl.expired());
+      }, remaining);
+      entry.resolve = (t) => { clearTimeout(timer); resolve(t); };
+      entry.reject = (e) => { clearTimeout(timer); reject(e); };
+      this.waiters.push(entry);
+    });
+  }
+
+  close() { try { this.ws.close(); } catch { /* already gone */ } }
+}
+
+function connect(url, budgetMs) {
+  return new Promise((resolve, reject) => {
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      reject(new ProbeError("config", `${url} is not a usable WebSocket address: ${e.message}`));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch { /* nothing to close */ }
+      reject(new ProbeError("timeout", `timed out connecting to ${url} after ${budgetMs / 1000}s`));
+    }, budgetMs);
+
+    ws.onopen = () => { clearTimeout(timer); resolve(new NodeConn(ws)); };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      // The browser deliberately withholds the reason, so say that rather than guess.
+      reject(new ProbeError("connect", `could not open a connection to ${url} — the endpoint refused it, is unreachable, or the browser blocked it`));
+    };
+  });
+}
+
+function parseGenesisHash(text) {
+  const hex = text.startsWith("0x") ? text.slice(2) : text;
+  if (!/^[0-9a-fA-F]*$/.test(hex)) throw new ProbeError("config", "genesis hash is not valid hex");
+  if (hex.length !== 64) throw new ProbeError("config", `genesis hash must be 32 bytes (64 hex chars), got ${Math.floor(hex.length / 2)} bytes`);
+  return hex.toLowerCase();
+}
+
+function blockNumber(header) {
+  const raw = header && header.number;
+  if (typeof raw !== "string") return null;
+  const n = Number.parseInt(raw.replace(/^0x/, ""), 16);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchGenesis(conn) {
+  const sentAt = performance.now();
+  conn.send({ jsonrpc: "2.0", method: "chain_getBlockHash", params: [0], id: ID.GENESIS });
+
+  const dl = deadline(TIMEOUT.rpc);
+  let value;
+  for (;;) {
+    value = JSON.parse(await conn.nextText(dl));
+    if (value.id === ID.GENESIS) break;
+  }
+  const latency = Math.round(performance.now() - sentAt);
+
+  if (value.error) throw new ProbeError("rpc_error", `node rejected chain_getBlockHash: ${JSON.stringify(value.error)}`);
+  if (typeof value.result !== "string") throw new ProbeError("protocol", "chain_getBlockHash returned no block hash");
+
+  return { hash: parseGenesisHash(value.result), latency };
+}
+
+function verifyGenesis(reported, expected) {
+  if (!expected) return false;
+  if (reported !== expected) {
+    throw new ProbeError("genesis_mismatch", `genesis hash mismatch — expected ${expected}, node reports ${reported}`);
+  }
+  return true;
+}
+
+async function queryNodeInfo(conn) {
+  const calls = [
+    [ID.NAME, "system_name"], [ID.CHAIN, "system_chain"], [ID.VERSION, "system_version"],
+    [ID.HEALTH, "system_health"], [ID.HEADER, "chain_getHeader"],
+  ];
+  // Sent before any reply is read, so the whole step costs one round trip.
+  for (const [id, method] of calls) conn.send({ jsonrpc: "2.0", method, params: [], id });
+
+  const pending = new Set(calls.map(([id]) => id));
+  const info = {};
+  const dl = deadline(TIMEOUT.rpc);
+
+  while (pending.size) {
+    let res;
+    try {
+      res = JSON.parse(await conn.nextText(dl));
+    } catch (e) {
+      throw e instanceof ProbeError ? new ProbeError(e.kind, `${e.message} (${pending.size} request(s) unanswered)`) : e;
+    }
+
+    if (typeof res.id !== "number" || !pending.delete(res.id)) continue;
+    if (res.error) continue; // A refused call costs only its own fields.
+
+    const r = res.result;
+    switch (res.id) {
+      case ID.NAME: info.name = typeof r === "string" ? r : undefined; break;
+      case ID.CHAIN: info.chain = typeof r === "string" ? r : undefined; break;
+      case ID.VERSION: info.version = typeof r === "string" ? r : undefined; break;
+      case ID.HEALTH:
+        // Absent must stay absent: "0 peers" and "did not say" mean opposite things.
+        if (typeof r?.peers === "number") info.peers = r.peers;
+        if (typeof r?.isSyncing === "boolean") info.is_syncing = r.isSyncing;
+        if (typeof r?.shouldHavePeers === "boolean") info.should_have_peers = r.shouldHavePeers;
+        break;
+      case ID.HEADER: {
+        const n = blockNumber(r);
+        if (n !== null) info.best_block = n;
+        break;
+      }
+    }
+  }
+  return info;
+}
+
+function checkRequirements(report, minPeers, requireSynced) {
+  if (minPeers !== null) {
+    if (report.peers === undefined) {
+      throw new ProbeError("requirement_unmet", "node did not report a peer count, so the peer requirement cannot be satisfied");
+    }
+    if (report.peers < minPeers) {
+      throw new ProbeError("requirement_unmet", `node has ${report.peers} peer(s), the requirement demands ${minPeers}`);
+    }
+  }
+  if (requireSynced) {
+    if (report.is_syncing === undefined) {
+      throw new ProbeError("requirement_unmet", "node did not report its sync state, so the sync requirement cannot be satisfied");
+    }
+    if (report.is_syncing) throw new ProbeError("requirement_unmet", "node is still syncing");
+  }
+}
+
+async function followHeads(conn, count, onHead, signal) {
+  conn.send({ jsonrpc: "2.0", method: "chain_subscribeNewHeads", params: [], id: ID.SUBSCRIBE });
+
+  const subDl = deadline(TIMEOUT.rpc);
+  let subId;
+  for (;;) {
+    const v = JSON.parse(await conn.nextText(subDl));
+    if (v.id !== ID.SUBSCRIBE) continue;
+    if (v.error) throw new ProbeError("rpc_error", `node rejected chain_subscribeNewHeads: ${JSON.stringify(v.error)}`);
+    if (typeof v.result !== "string") throw new ProbeError("protocol", "subscription returned no id");
+    subId = v.result;
+    break;
+  }
+
+  let seen = 0;
+  while (seen < count) {
+    if (signal.stopped) break;
+    const dl = deadline(TIMEOUT.head); // fresh budget per header — the one legitimate long wait
+    for (;;) {
+      let v;
+      try {
+        v = JSON.parse(await conn.nextText(dl));
+      } catch (e) {
+        throw e instanceof ProbeError ? new ProbeError(e.kind, `${e.message} (saw ${seen} of ${count} headers)`) : e;
+      }
+      if (v.method !== "chain_newHead" || v.params?.subscription !== subId) continue;
+      onHead(blockNumber(v.params.result));
+      break;
+    }
+    seen += 1;
+  }
+
+  conn.send({ jsonrpc: "2.0", method: "chain_unsubscribeNewHeads", params: [subId], id: ID.UNSUBSCRIBE });
+  return seen;
+}
+
+/* ------------------------------- UI ------------------------------- */
+
+const $ = (id) => document.getElementById(id);
+
+const STEPS = [
+  ["connect", "Connect"],
+  ["genesis", "Verify chain identity"],
+  ["query", "Query identity, health, height"],
+  ["require", "Apply requirements"],
+  ["follow", "Follow new heads"],
+];
+
+const MARKS = { pending: "·", running: "▸", pass: "✓", fail: "✕", skip: "–" };
+
+function renderSteps() {
+  $("checks").innerHTML = STEPS.map(([key, name]) => `
+    <div class="checkrow" data-state="pending" id="step-${key}">
+      <span class="mark">${MARKS.pending}</span>
+      <span class="name">${name}</span>
+      <span class="value" id="val-${key}"></span>
+      <span class="note" id="note-${key}"></span>
+    </div>`).join("");
+}
+
+function setStep(key, state, value = "", note = "") {
+  const row = $(`step-${key}`);
+  if (!row) return;
+  row.dataset.state = state;
+  row.querySelector(".mark").textContent = MARKS[state];
+  $(`val-${key}`).textContent = value;
+  $(`note-${key}`).textContent = note;
+}
+
+function setVerdict(state, headline, detail, kind) {
+  const bar = $("verdict");
+  bar.dataset.state = state;
+  $("verdict-headline").textContent = headline;
+  const d = $("verdict-detail");
+  d.textContent = "";
+  if (kind) {
+    const chip = document.createElement("span");
+    chip.className = "kindchip";
+    chip.textContent = kind;
+    d.append(chip, " ");
+  }
+  d.append(detail);
+}
+
+function shortHash(hex) { return `0x${hex.slice(0, 8)}…${hex.slice(-6)}`; }
+
+let running = false;
+const signal = { stopped: false };
+let elapsedTimer = null;
+
+$("preset").addEventListener("change", (e) => {
+  const p = PRESETS[e.target.value];
+  if (!p) { $("endpoint").focus(); return; }
+  $("endpoint").value = p.url;
+  $("genesis").value = p.genesis;
+});
+
+$("endpoint").addEventListener("input", () => { $("preset").value = "custom"; });
+
+$("stop").addEventListener("click", () => { signal.stopped = true; });
+
+$("copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("report-json").textContent);
+    $("copy").textContent = "Copied";
+    setTimeout(() => { $("copy").textContent = "Copy"; }, 1400);
+  } catch {
+    $("copy").textContent = "Press ⌘C";
+    setTimeout(() => { $("copy").textContent = "Copy"; }, 1800);
+  }
+});
+
+$("form").addEventListener("submit", (e) => { e.preventDefault(); probe(); });
+
+async function probe() {
+  if (running) return;
+  running = true;
+  signal.stopped = false;
+  $("run").disabled = true;
+  $("stop").disabled = false;
+  $("feed").hidden = true;
+  $("feed-body").innerHTML = "";
+  $("report").hidden = true;
+  renderSteps();
+
+  const started = performance.now();
+  elapsedTimer = setInterval(() => {
+    $("elapsed").textContent = `${((performance.now() - started) / 1000).toFixed(1)}s`;
+  }, 100);
+
+  const endpoint = $("endpoint").value.trim();
+  const followCount = Math.max(0, Number.parseInt($("follow").value, 10) || 0);
+  const peersRaw = $("peers").value.trim();
+  const minPeers = peersRaw === "" ? null : Number.parseInt(peersRaw, 10);
+  const requireSynced = $("synced").checked;
+
+  const report = { endpoint, ok: false, genesis_verified: false };
+  let conn = null;
+  let lastHead = null;
+
+  setVerdict("running", "Probing…", `${endpoint}`);
+
+  try {
+    let expected = null;
+    const genesisRaw = $("genesis").value.trim();
+    if (genesisRaw) expected = parseGenesisHash(genesisRaw);
+    if (minPeers !== null && !Number.isFinite(minPeers)) {
+      throw new ProbeError("config", "peer requirement must be a number");
+    }
+
+    setStep("connect", "running");
+    conn = await connect(endpoint, TIMEOUT.connect);
+    setStep("connect", "pass", "open");
+
+    setStep("genesis", "running");
+    const genesis = await fetchGenesis(conn);
+    report.genesis_hash = `0x${genesis.hash}`;
+    report.rpc_latency_ms = genesis.latency;
+    report.genesis_verified = verifyGenesis(genesis.hash, expected);
+    setStep("genesis", "pass", `${genesis.latency} ms`,
+      report.genesis_verified
+        ? `${shortHash(genesis.hash)} — matches the hash you required`
+        : `${shortHash(genesis.hash)} — reported only; nothing required, so nothing proven`);
+
+    setStep("query", "running");
+    const info = await queryNodeInfo(conn);
+    Object.assign(report, info);
+    setStep("query", "pass",
+      info.best_block !== undefined ? `#${info.best_block.toLocaleString()}` : "no height",
+      [info.name, info.chain, info.version && `v${info.version}`,
+       info.peers !== undefined ? `${info.peers} peers` : "peer count not reported",
+       info.is_syncing === undefined ? "sync state not reported" : (info.is_syncing ? "syncing" : "synced"),
+      ].filter(Boolean).join(" · "));
+
+    setStep("require", "running");
+    checkRequirements(report, minPeers, requireSynced);
+    const bars = [
+      minPeers !== null ? `peers ≥ ${minPeers}` : null,
+      requireSynced ? "not syncing" : null,
+    ].filter(Boolean);
+    setStep("require", "pass", bars.length ? "met" : "none set",
+      bars.length ? `Required ${bars.join(", ")}.` : "No bars set — the exit code only means the node answered.");
+
+    if (followCount > 0) {
+      setStep("follow", "running", `0 / ${followCount}`);
+      $("feed").hidden = false;
+      let got = 0;
+      const seen = await followHeads(conn, followCount, (n) => {
+        got += 1;
+        const gap = lastHead !== null && n !== null ? n - lastHead : null;
+        lastHead = n;
+        const row = document.createElement("div");
+        row.className = "feed-row";
+        row.innerHTML = `<span class="num">#${n === null ? "?" : n.toLocaleString()}</span>
+                         <span class="gap">${gap === null ? "first" : `+${gap} block${gap === 1 ? "" : "s"}`}</span>`;
+        $("feed-body").prepend(row);
+        $("feed-count").textContent = `${got} of ${followCount}`;
+        setStep("follow", "running", `${got} / ${followCount}`);
+      }, signal);
+      report.heads_followed = seen;
+      setStep("follow", "pass", `${seen} / ${followCount}`,
+        signal.stopped ? "Stopped early." : "Unsubscribed.");
+    } else {
+      setStep("follow", "skip", "off", "Set a count above to watch the chain produce blocks.");
+    }
+
+    report.ok = true;
+    setVerdict("pass", "Usable",
+      `${report.chain ?? "This node"} · ${report.peers ?? "?"} peers · block ${report.best_block?.toLocaleString() ?? "?"} · ${report.rpc_latency_ms} ms round trip`);
+  } catch (err) {
+    const kind = err instanceof ProbeError ? err.kind : "protocol";
+    report.failure = kind;
+    report.error = err.message;
+
+    for (const [key] of STEPS) {
+      const row = $(`step-${key}`);
+      if (!row) continue;
+      if (row.dataset.state === "running") setStep(key, "fail", "failed", err.message);
+      else if (row.dataset.state === "pending") setStep(key, "skip", "", "Not reached.");
+    }
+
+    setVerdict("fail", "Not usable", err.message, kind);
+  } finally {
+    if (conn) conn.close();
+    clearInterval(elapsedTimer);
+    $("elapsed").textContent = `${((performance.now() - started) / 1000).toFixed(1)}s`;
+    $("run").disabled = false;
+    $("stop").disabled = true;
+    running = false;
+
+    // Ordered like the Rust report, and printed on failure too — a probe that
+    // goes silent exactly when the node breaks is no use to whatever reads it.
+    const ordered = {};
+    for (const k of ["endpoint", "ok", "failure", "error", "genesis_hash", "genesis_verified",
+                     "rpc_latency_ms", "name", "chain", "version", "peers", "is_syncing",
+                     "should_have_peers", "best_block", "heads_followed"]) {
+      if (report[k] !== undefined) ordered[k] = report[k];
+    }
+    $("report-json").textContent = JSON.stringify(ordered, null, 2);
+    $("report").hidden = false;
+  }
+}
+
+renderSteps();
+</script>
+</body>
+</html>
