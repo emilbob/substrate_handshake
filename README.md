@@ -104,16 +104,19 @@ The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE enc
 
 ## Try it in a browser
 
-**→ [emilbob.github.io/substrate-node-probe](https://emilbob.github.io/substrate-node-probe/)**
+**→ [substrate-node-probe.onrender.com](https://substrate-node-probe.onrender.com/)** — runs the real binary
+**→ [emilbob.github.io/substrate-node-probe](https://emilbob.github.io/substrate-node-probe/)** — runs in your tab
 
 The same checks against a live node, with results filling in as they resolve. Source is [`web/index.html`](web/index.html) — one self-contained file, no build step.
 
 The page runs the checks one of two ways, and always says which:
 
-| Engine | When | What actually runs |
+| Engine | Where | What actually runs |
 | --- | --- | --- |
-| **JavaScript** | Static hosting, e.g. GitHub Pages | A reimplementation of the checks in the browser tab, connecting straight to the node. Nothing is proxied. |
-| **Rust** | Served by `serve` (see below) | The real binary, server-side. The report is its output, unmodified. |
+| **Rust** | Render | The real binary, server-side. The report is its output, unmodified. |
+| **JavaScript** | GitHub Pages, or any static host | A reimplementation of the checks in the browser tab, connecting straight to the node. Nothing is proxied. |
+
+Render's free tier sleeps after ~15 minutes idle, so the first request after a quiet spell takes a while to wake. The Pages copy has no backend to wait on and is always instant — which is the honest trade between the two.
 
 The page asks `/api/health` on load; if a backend answers, it offers the switch and defaults to Rust. On a static host there is nothing to switch to, so it stays in browser mode and says so rather than implying the binary ran.
 
@@ -140,7 +143,7 @@ curl -s localhost:8080/api/probe -H 'Content-Type: application/json' \
 
 It is feature-gated, so a plain `cargo build` still produces only the CLI without compiling a web stack it will never call.
 
-[`render.yaml`](render.yaml) provisions it on [Render](https://render.com) from the [`Dockerfile`](Dockerfile) — *New → Blueprint → pick this repo*. On Render's free tier the service sleeps after ~15 minutes idle, so the first request after a quiet spell is slow.
+[`render.yaml`](render.yaml) provisions it on [Render](https://render.com) from the [`Dockerfile`](Dockerfile) — *New → Blueprint → pick this repo*, nothing to configure by hand. That is what runs at [substrate-node-probe.onrender.com](https://substrate-node-probe.onrender.com/).
 
 ### Running it for strangers is not running it for yourself
 
