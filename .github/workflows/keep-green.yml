@@ -16,9 +16,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # Only pay for the Node toolchain in repos that actually have one; this
+      # workflow is shared with JS projects, so the step stays, just guarded.
       - uses: actions/setup-node@v4
+        if: hashFiles('package.json') != ''
         with:
           node-version: 22
+
+      - uses: actions/cache@v4
+        if: hashFiles('**/Cargo.lock') != ''
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - name: Build & test (auto-detected toolchain)
         run: |
           set -e
@@ -44,6 +59,16 @@ jobs:
           if [ -n "$ct" ]; then
             ran=1
             cd "$(dirname "$ct")"
+            cargo fmt --check
+            # Clippy blocks on PRs, where new warnings mean new code. On the
+            # scheduled run it only reports: a future toolchain adding a lint
+            # would otherwise fail the health check on untouched code, which is
+            # exactly the false alarm that trains you to ignore it.
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              cargo clippy --all-targets -- -D warnings
+            else
+              cargo clippy --all-targets || echo "::warning::clippy reported warnings (non-blocking on a scheduled run)"
+            fi
             cargo build
             cargo test
             cd - >/dev/null
