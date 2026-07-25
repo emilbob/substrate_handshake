@@ -1,13 +1,13 @@
 use env_logger::Env;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
 use parity_scale_codec::{Decode, Encode};
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_stream::StreamExt;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -110,36 +110,75 @@ async fn query_node_info(
         }),
     ];
 
+    // Track the ids we are still waiting on, so that a response — successful or
+    // not — retires exactly the request it belongs to. Counting responses instead
+    // would let an unsolicited message satisfy the loop.
+    let mut pending: HashSet<u64> = requests
+        .iter()
+        .filter_map(|r| r["id"].as_u64())
+        .collect::<HashSet<_>>();
+
     let mut ws_stream = ws_stream.lock().await;
 
     for request in &requests {
-        info!("Sending request: {}", request.to_string());
+        info!("Sending request: {}", request);
         ws_stream.send(Message::Text(request.to_string())).await?;
     }
 
-    let mut received_responses = 0;
+    while !pending.is_empty() {
+        let msg = match ws_stream.next().await {
+            Some(msg) => msg?,
+            // The node hung up before answering everything. Without this the loop
+            // spins on a terminated stream forever.
+            None => {
+                return Err(format!(
+                    "connection closed with {} request(s) unanswered: {:?}",
+                    pending.len(),
+                    pending
+                )
+                .into())
+            }
+        };
 
-    while received_responses < requests.len() {
-        if let Some(msg) = ws_stream.next().await {
-            let msg = msg?;
-            if let Message::Text(response) = msg {
-                let response: serde_json::Value = serde_json::from_str(&response)?;
-                if let Some(error) = response.get("error") {
-                    error!(
-                        "Error in response for request id {}: {}",
-                        response["id"], error
-                    );
-                } else if let Some(id) = response.get("id") {
-                    info!("Received response for request id {}: {}", id, response);
-                    received_responses += 1;
-                } else {
-                    error!("Received unexpected response: {}", response);
+        if let Message::Text(response) = msg {
+            let response: serde_json::Value = serde_json::from_str(&response)?;
+            match response["id"].as_u64() {
+                Some(id) if pending.remove(&id) => {
+                    if let Some(error) = response.get("error") {
+                        error!("Error in response for request id {}: {}", id, error);
+                    } else {
+                        info!("Received response for request id {}: {}", id, response);
+                    }
                 }
+                Some(id) => error!("Received response for unknown request id {}", id),
+                None => error!("Received unexpected response: {}", response),
             }
         }
     }
 
     Ok(())
+}
+
+/// Parses a hex-encoded 32-byte genesis hash.
+///
+/// # Arguments
+///
+/// * `hex_str` - The genesis hash as a hex string, with or without a `0x` prefix.
+///
+/// # Returns
+///
+/// The decoded hash, or an error describing why the input was rejected.
+fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes =
+        hex::decode(hex_str).map_err(|e| format!("genesis hash is not valid hex: {}", e))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        format!(
+            "genesis hash must be 32 bytes (64 hex chars), got {} bytes",
+            bytes.len()
+        )
+        .into()
+    })
 }
 
 /// Struct to parse command-line arguments.
@@ -168,10 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let opt = Opt::from_args();
 
-    let genesis_hash_vec = hex::decode(&opt.genesis_hash)?;
-    let genesis_hash: [u8; 32] = genesis_hash_vec
-        .try_into()
-        .expect("Invalid length for genesis hash");
+    let genesis_hash = parse_genesis_hash(&opt.genesis_hash)?;
 
     info!("Connecting to node at {}", opt.node_address);
     let (ws_stream, _) = match connect_async(&opt.node_address).await {
@@ -200,4 +236,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Node information queried!");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    const VALID_HASH: &str = "5972ecbfbc42507482dbcb0a2892bcd70161fd9acdfdf7e6455ab39bac3dfb83";
+
+    /// Runs `query_node_info` against a mock node driven by `serve`, failing the
+    /// test rather than hanging the suite if the client never returns.
+    async fn run_against_mock<F, Fut>(serve: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(WebSocketStream<tokio::net::TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            serve(accept_async(tcp).await.unwrap()).await;
+        });
+
+        let (stream, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            query_node_info(Arc::new(Mutex::new(stream))),
+        )
+        .await
+        .expect("timed out — query_node_info never returned")
+    }
+
+    #[test]
+    fn genesis_hash_rejects_bad_input_without_panicking() {
+        assert!(parse_genesis_hash("zz").is_err(), "not hex");
+        assert!(
+            parse_genesis_hash("abcd").is_err(),
+            "valid hex, wrong length"
+        );
+        assert_eq!(
+            parse_genesis_hash(VALID_HASH).unwrap(),
+            parse_genesis_hash(&format!("0x{VALID_HASH}")).unwrap(),
+            "0x prefix should be accepted"
+        );
+    }
+
+    /// The node hangs up after answering only one of the three requests. The
+    /// terminated stream must surface an error, not spin on `None` forever.
+    #[tokio::test]
+    async fn hangup_errors_instead_of_spinning() {
+        let result = run_against_mock(|mut ws| async move {
+            for _ in 0..3 {
+                ws.next().await;
+            }
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","id":1,"result":"node"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.close(None).await.unwrap();
+        })
+        .await;
+
+        assert!(result.is_err(), "early hangup should surface an error");
+    }
+
+    /// Every request is answered with a JSON-RPC error. Errors still retire the
+    /// request they belong to, so the loop must terminate.
+    #[tokio::test]
+    async fn all_error_responses_still_terminate() {
+        let result = run_against_mock(|mut ws| async move {
+            for id in 1..=3 {
+                ws.next().await;
+                ws.send(Message::Text(format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32601}}}}"#
+                )))
+                .await
+                .unwrap();
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "errored responses are still responses");
+    }
 }
