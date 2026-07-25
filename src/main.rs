@@ -1,3 +1,4 @@
+use clap::Parser;
 use env_logger::Env;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
@@ -5,7 +6,6 @@ use parity_scale_codec::{Decode, Encode};
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::Duration;
-use structopt::StructOpt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -255,18 +255,19 @@ fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Err
     })
 }
 
-/// Struct to parse command-line arguments.
-#[derive(StructOpt, Debug)]
-#[structopt(name = "substrate_handshake")]
+/// Connect to a Substrate node, verify which chain it serves, and query its
+/// identity over JSON-RPC.
+#[derive(Parser, Debug)]
+#[command(name = "substrate_handshake", version)]
 struct Opt {
     /// Node address to connect to
-    #[structopt(long, default_value = "ws://127.0.0.1:9944")]
+    #[arg(long, default_value = "ws://127.0.0.1:9944")]
     node_address: String,
 
     /// Genesis hash the node must report, with or without a `0x` prefix. The
     /// client refuses to continue if the node reports a different one. Omit it
     /// to report the node's genesis hash without enforcing a value.
-    #[structopt(long)]
+    #[arg(long)]
     genesis_hash: Option<String>,
 }
 
@@ -322,7 +323,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if let Err(e) = run(Opt::from_args()).await {
+    if let Err(e) = run(Opt::parse()).await {
         error!("{e}");
         std::process::exit(1);
     }
