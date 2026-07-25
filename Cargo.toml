@@ -7,9 +7,20 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
 hex = "0.4"
-tokio-tungstenite = "0.24"
+# rustls rather than native-tls: no OpenSSL system dependency, so the build is
+# self-contained on CI. Without a TLS feature every wss:// endpoint is
+# unreachable, which is all of the public ones.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 ships no crypto provider by default; `ring` is the pure-Rust one,
+# installed explicitly in main(). Without it every wss:// connection panics.
+rustls = { version = "0.23", features = ["ring"] }
 parity-scale-codec = { version = "3.1.0", features = ["derive"] }
 futures-util = "0.3"
 log = "0.4"
 env_logger = "0.9"
 structopt = "0.3"
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) gives tests virtual time, so the
+# timeout paths are covered without burning real seconds.
+tokio = { version = "1", features = ["test-util"] }
