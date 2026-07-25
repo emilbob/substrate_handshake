@@ -22,8 +22,3 @@ futures-util = "0.3"
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
-
-[dev-dependencies]
-# `test-util` (not part of tokio's `full`) gives tests virtual time, so the
-# timeout paths are covered without burning real seconds.
-tokio = { version = "1", features = ["test-util"] }

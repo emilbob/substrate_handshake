@@ -20,6 +20,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// node that accepts the socket and then goes quiet would hang the client.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait for a pushed block header. Deliberately far longer than
+/// `RPC_TIMEOUT`: this waits on the chain's block time, not on the node being
+/// responsive. Polkadot targets ~6s, but parachains and dev chains vary widely.
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The network waits, grouped so they can be shortened in tests.
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    /// Waiting for the node to answer a request.
+    rpc: Duration,
+    /// Waiting for the chain to produce a block.
+    head: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            rpc: RPC_TIMEOUT,
+            head: SUBSCRIPTION_TIMEOUT,
+        }
+    }
+}
+
 /// A SCALE-encoded handshake message, kept as a worked example of Substrate's
 /// wire codec (`parity-scale-codec`) — field order and types are load-bearing,
 /// so encode and decode must agree exactly.
@@ -72,15 +95,20 @@ impl HandshakeMessage {
 /// # Arguments
 ///
 /// * `ws_stream` - The connection to read from.
+/// * `timeout` - How long to wait. Answering a request and producing a block
+///   are different waits, so the caller chooses.
 ///
 /// # Returns
 ///
 /// The body of the next text frame.
-async fn next_text_frame(ws_stream: &mut NodeStream) -> Result<String, Box<dyn std::error::Error>> {
+async fn next_text_frame(
+    ws_stream: &mut NodeStream,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
     loop {
-        let msg = tokio::time::timeout(RPC_TIMEOUT, ws_stream.next())
+        let msg = tokio::time::timeout(timeout, ws_stream.next())
             .await
-            .map_err(|_| format!("node sent no response within {RPC_TIMEOUT:?}"))?
+            .map_err(|_| format!("node sent no response within {timeout:?}"))?
             .ok_or("connection closed by the node")??;
 
         match msg {
@@ -110,6 +138,7 @@ async fn next_text_frame(ws_stream: &mut NodeStream) -> Result<String, Box<dyn s
 async fn check_genesis_hash(
     ws_stream: &mut NodeStream,
     expected: Option<&[u8; 32]>,
+    timeouts: Timeouts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const REQUEST_ID: u64 = 0;
 
@@ -124,7 +153,7 @@ async fn check_genesis_hash(
     ws_stream.send(Message::Text(request.to_string())).await?;
 
     let response: serde_json::Value = loop {
-        let text = next_text_frame(ws_stream).await?;
+        let text = next_text_frame(ws_stream, timeouts.rpc).await?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if value["id"].as_u64() == Some(REQUEST_ID) {
             break value;
@@ -172,7 +201,10 @@ async fn check_genesis_hash(
 /// # Returns
 ///
 /// A Result indicating the success or failure of the query.
-async fn query_node_info(ws_stream: &mut NodeStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn query_node_info(
+    ws_stream: &mut NodeStream,
+    timeouts: Timeouts,
+) -> Result<(), Box<dyn std::error::Error>> {
     let requests = vec![
         json!({
             "jsonrpc": "2.0",
@@ -208,13 +240,15 @@ async fn query_node_info(ws_stream: &mut NodeStream) -> Result<(), Box<dyn std::
     }
 
     while !pending.is_empty() {
-        let text = next_text_frame(ws_stream).await.map_err(|e| {
-            format!(
-                "{e} ({} request(s) unanswered: {:?})",
-                pending.len(),
-                pending
-            )
-        })?;
+        let text = next_text_frame(ws_stream, timeouts.rpc)
+            .await
+            .map_err(|e| {
+                format!(
+                    "{e} ({} request(s) unanswered: {:?})",
+                    pending.len(),
+                    pending
+                )
+            })?;
 
         let response: serde_json::Value = serde_json::from_str(&text)?;
         match response["id"].as_u64() {
@@ -229,6 +263,101 @@ async fn query_node_info(ws_stream: &mut NodeStream) -> Result<(), Box<dyn std::
             None => error!("Received unexpected response: {}", response),
         }
     }
+
+    Ok(())
+}
+
+/// Follows new block headers pushed by the node.
+///
+/// This is the one thing here that genuinely needs a WebSocket: the request and
+/// response calls above would work as well over HTTP POST, but a subscription
+/// has the node push frames unprompted for as long as the connection lives.
+///
+/// Subscribes with `chain_subscribeNewHeads`, reports `count` headers as they
+/// arrive, then unsubscribes so the node stops sending.
+///
+/// # Arguments
+///
+/// * `ws_stream` - The connection to the node.
+/// * `count` - How many headers to observe before unsubscribing.
+///
+/// # Returns
+///
+/// A Result that is an error if the node refuses the subscription or stops
+/// producing blocks.
+async fn follow_new_heads(
+    ws_stream: &mut NodeStream,
+    count: u64,
+    timeouts: Timeouts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const SUBSCRIBE_ID: u64 = 4;
+    const UNSUBSCRIBE_ID: u64 = 5;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "chain_subscribeNewHeads",
+        "params": [],
+        "id": SUBSCRIBE_ID,
+    });
+    info!("Subscribing to new heads: {}", request);
+    ws_stream.send(Message::Text(request.to_string())).await?;
+
+    // The subscription id arrives as the reply to the subscribe call; every
+    // later notification carries it, which is how concurrent subscriptions on
+    // one connection are told apart.
+    let subscription_id = loop {
+        let text = next_text_frame(ws_stream, timeouts.rpc).await?;
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        if value["id"].as_u64() != Some(SUBSCRIBE_ID) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(format!("node rejected chain_subscribeNewHeads: {error}").into());
+        }
+        break value["result"]
+            .as_str()
+            .ok_or("subscription returned no id")?
+            .to_string();
+    };
+    info!("Subscribed with id {subscription_id}");
+
+    let mut seen = 0;
+    while seen < count {
+        // A block is not a reply, so this waits on the chain's block time
+        // rather than on the node's responsiveness.
+        let text = next_text_frame(ws_stream, timeouts.head)
+            .await
+            .map_err(|e| format!("{e} (saw {seen} of {count} headers)"))?;
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+
+        if value["method"].as_str() != Some("chain_newHead")
+            || value["params"]["subscription"].as_str() != Some(&subscription_id)
+        {
+            continue;
+        }
+
+        let header = &value["params"]["result"];
+        let number = header["number"]
+            .as_str()
+            .and_then(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).ok());
+        match number {
+            Some(number) => info!(
+                "New head #{number} parent={}",
+                header["parentHash"].as_str().unwrap_or("?")
+            ),
+            None => error!("New head with unreadable block number: {header}"),
+        }
+        seen += 1;
+    }
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "chain_unsubscribeNewHeads",
+        "params": [subscription_id],
+        "id": UNSUBSCRIBE_ID,
+    });
+    ws_stream.send(Message::Text(request.to_string())).await?;
+    info!("Unsubscribed after {seen} header(s)");
 
     Ok(())
 }
@@ -269,6 +398,11 @@ struct Opt {
     /// to report the node's genesis hash without enforcing a value.
     #[arg(long)]
     genesis_hash: Option<String>,
+
+    /// After querying, follow this many new block headers as the node pushes
+    /// them, then unsubscribe and exit. Omit to exit straight after the query.
+    #[arg(long, value_name = "COUNT")]
+    follow: Option<u64>,
 }
 
 /// Connects to the node, verifies its chain identity and queries node info.
@@ -281,6 +415,7 @@ struct Opt {
 ///
 /// A Result indicating the success or failure of the run.
 async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
+    let timeouts = Timeouts::default();
     let expected_genesis = opt
         .genesis_hash
         .as_deref()
@@ -300,9 +435,13 @@ async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to connect to {}: {e}", opt.node_address))?;
     info!("Connected to the node with response: {:?}", response);
 
-    check_genesis_hash(&mut ws_stream, expected_genesis.as_ref()).await?;
-    query_node_info(&mut ws_stream).await?;
+    check_genesis_hash(&mut ws_stream, expected_genesis.as_ref(), timeouts).await?;
+    query_node_info(&mut ws_stream, timeouts).await?;
     info!("Node information queried!");
+
+    if let Some(count) = opt.follow {
+        follow_new_heads(&mut ws_stream, count, timeouts).await?;
+    }
 
     ws_stream.close(None).await.ok();
     Ok(())
@@ -355,6 +494,17 @@ mod tests {
         connect_async(format!("ws://{addr}")).await.unwrap().0
     }
 
+    /// Short real timeouts. Virtual time (`start_paused`) is unusable here:
+    /// tokio auto-advances whenever the runtime is idle, and a socket read that
+    /// has not arrived yet counts as idle — so the clock jumps past the timeout
+    /// while the mock's reply is still in flight, and the test fails at random.
+    fn fast() -> Timeouts {
+        Timeouts {
+            rpc: Duration::from_millis(250),
+            head: Duration::from_millis(250),
+        }
+    }
+
     /// Answers a single `chain_getBlockHash` request with `hash`.
     async fn serve_genesis(mut ws: WebSocketStream<TcpStream>, hash: &str) {
         ws.next().await;
@@ -399,7 +549,9 @@ mod tests {
     async fn genesis_hash_matching_the_node_is_accepted() {
         let mut ws = mock_node(|ws| serve_genesis(ws, VALID_HASH)).await;
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
-        assert!(check_genesis_hash(&mut ws, Some(&expected)).await.is_ok());
+        assert!(check_genesis_hash(&mut ws, Some(&expected), fast())
+            .await
+            .is_ok());
     }
 
     /// The check that gives `--genesis-hash` its meaning: a node on another
@@ -409,7 +561,7 @@ mod tests {
         let mut ws = mock_node(|ws| serve_genesis(ws, OTHER_HASH)).await;
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
 
-        let err = check_genesis_hash(&mut ws, Some(&expected))
+        let err = check_genesis_hash(&mut ws, Some(&expected), fast())
             .await
             .expect_err("a different chain must not be accepted")
             .to_string();
@@ -421,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn omitted_genesis_hash_accepts_any_chain() {
         let mut ws = mock_node(|ws| serve_genesis(ws, OTHER_HASH)).await;
-        assert!(check_genesis_hash(&mut ws, None).await.is_ok());
+        assert!(check_genesis_hash(&mut ws, None, fast()).await.is_ok());
     }
 
     #[tokio::test]
@@ -438,12 +590,14 @@ mod tests {
         .await;
 
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
-        assert!(check_genesis_hash(&mut ws, Some(&expected)).await.is_err());
+        assert!(check_genesis_hash(&mut ws, Some(&expected), fast())
+            .await
+            .is_err());
     }
 
     /// A node that accepts the socket and then says nothing must not hang the
-    /// client. Uses virtual time, so this costs no wall-clock seconds.
-    #[tokio::test(start_paused = true)]
+    /// client.
+    #[tokio::test]
     async fn silent_node_times_out() {
         let mut ws = mock_node(|mut ws| async move {
             // Accept the request, then never answer.
@@ -453,11 +607,103 @@ mod tests {
         .await;
 
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
-        let err = check_genesis_hash(&mut ws, Some(&expected))
+        let err = check_genesis_hash(&mut ws, Some(&expected), fast())
             .await
             .expect_err("a silent node must time out")
             .to_string();
         assert!(err.contains("no response"), "unhelpful error: {err}");
+    }
+
+    /// Serves a new-heads subscription: confirms it, pushes `heads` headers
+    /// starting at block 100, then waits for the unsubscribe.
+    async fn serve_new_heads(mut ws: WebSocketStream<TcpStream>, heads: u64) {
+        ws.next().await;
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":4,"result":"sub-abc"}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        for i in 0..heads {
+            ws.send(Message::Text(format!(
+                r#"{{"jsonrpc":"2.0","method":"chain_newHead","params":{{"subscription":"sub-abc","result":{{"number":"0x{:x}","parentHash":"0xdead"}}}}}}"#,
+                100 + i
+            )))
+            .await
+            .unwrap();
+        }
+        ws.next().await;
+    }
+
+    #[tokio::test]
+    async fn follows_the_requested_number_of_heads() {
+        let mut ws = mock_node(|ws| serve_new_heads(ws, 3)).await;
+        assert!(follow_new_heads(&mut ws, 3, fast()).await.is_ok());
+    }
+
+    /// Notifications for a different subscription must not count — one
+    /// connection can carry several.
+    #[tokio::test]
+    async fn ignores_other_subscriptions() {
+        let mut ws = mock_node(|mut ws| async move {
+            ws.next().await;
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","id":4,"result":"sub-abc"}"#.into(),
+            ))
+            .await
+            .unwrap();
+            // Another subscription's header, then ours.
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","method":"chain_newHead","params":{"subscription":"sub-OTHER","result":{"number":"0x999","parentHash":"0x0"}}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","method":"chain_newHead","params":{"subscription":"sub-abc","result":{"number":"0x64","parentHash":"0x0"}}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.next().await;
+        })
+        .await;
+
+        assert!(
+            follow_new_heads(&mut ws, 1, fast()).await.is_ok(),
+            "the foreign notification should not have satisfied the count"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_rejection_is_reported() {
+        let mut ws = mock_node(|mut ws| async move {
+            ws.next().await;
+            ws.send(Message::Text(
+                r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"unsafe"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.next().await;
+        })
+        .await;
+
+        let err = follow_new_heads(&mut ws, 1, fast())
+            .await
+            .expect_err("a refused subscription must not look like success")
+            .to_string();
+        assert!(err.contains("rejected"), "unhelpful error: {err}");
+    }
+
+    /// A chain that stalls mid-subscription must time out, and the error must
+    /// say how far it got.
+    #[tokio::test]
+    async fn stalled_chain_times_out_and_reports_progress() {
+        let mut ws = mock_node(|ws| serve_new_heads(ws, 1)).await;
+
+        let err = follow_new_heads(&mut ws, 3, fast())
+            .await
+            .expect_err("a stalled chain must time out")
+            .to_string();
+        assert!(err.contains("saw 1 of 3"), "unhelpful error: {err}");
     }
 
     /// The node hangs up after answering only one of the three requests. The
@@ -478,7 +724,7 @@ mod tests {
         .await;
 
         assert!(
-            query_node_info(&mut ws).await.is_err(),
+            query_node_info(&mut ws, fast()).await.is_err(),
             "early hangup should surface an error"
         );
     }
@@ -500,7 +746,7 @@ mod tests {
         .await;
 
         assert!(
-            query_node_info(&mut ws).await.is_ok(),
+            query_node_info(&mut ws, fast()).await.is_ok(),
             "errored responses are still responses"
         );
     }
