@@ -1,0 +1,44 @@
+name: pages
+
+# Publishes web/ to GitHub Pages. The page is a single static file with no build
+# step, so this uploads the directory as-is rather than running a toolchain.
+#
+# Only fires when the page itself changes: a Rust-only commit has nothing to
+# republish, and a deploy that runs on every push makes the deploy history
+# useless for answering "when did the page last change?".
+on:
+  push:
+    branches: [master]
+    paths:
+      - "web/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in flight — a half-published page is worse than a
+# slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
