@@ -133,6 +133,18 @@
 
   .elapsed { font-family: var(--mono); font-size: var(--step--1); color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
 
+  /* Engine switch — only shown when a real backend answered /api/health. */
+  .engine { display: inline-flex; align-items: center; gap: 0.6rem; }
+  .seg { display: inline-flex; border: 1px solid var(--rule-strong); border-radius: 2px; overflow: hidden; }
+  .seg button {
+    font-family: var(--mono); font-size: var(--step--1); font-weight: 600;
+    letter-spacing: 0.04em; text-transform: none;
+    padding: 0.3rem 0.6rem; border: 0; border-radius: 0;
+    background: transparent; color: var(--muted);
+  }
+  .seg button + button { border-left: 1px solid var(--rule-strong); }
+  .seg button.on { background: var(--accent); color: var(--ground); }
+
   /* verdict banner */
   .verdict-bar {
     margin-top: 1.5rem; border: 1px solid var(--rule-strong); border-radius: 3px;
@@ -209,7 +221,7 @@
     <span class="label">Live · in your browser</span>
   </header>
 
-  <p class="disclosure">
+  <p class="disclosure" id="disclosure">
     <strong>This is not the Rust binary.</strong> A browser cannot execute it. What runs here is a
     JavaScript reimplementation of the same checks, speaking the same JSON-RPC over the same
     WebSocket — same request ids, same failure kinds, same rule that an unprovable requirement
@@ -259,6 +271,13 @@
     <div class="actions">
       <button type="submit" id="run">Probe</button>
       <button type="button" class="ghost" id="stop" disabled>Stop</button>
+      <span class="engine" id="engine" hidden>
+        <span class="label">Engine</span>
+        <span class="seg">
+          <button type="button" data-engine="server" class="on">Rust</button>
+          <button type="button" data-engine="browser">JavaScript</button>
+        </span>
+      </span>
       <span class="elapsed" id="elapsed"></span>
     </div>
   </form>
@@ -596,6 +615,119 @@ let running = false;
 const signal = { stopped: false };
 let elapsedTimer = null;
 
+/* Which implementation actually runs the checks.
+   "browser" — the JavaScript above, talking to the node directly.
+   "server"  — POST to this origin, where the real Rust binary runs it.
+   Only offered when a backend answers; on a static host there is nothing to
+   switch to, and pretending otherwise would misrepresent what ran. */
+let engine = "browser";
+let backend = null;
+
+const DISCLOSURE = {
+  browser: `<strong>This is not the Rust binary.</strong> A browser cannot execute it. What runs
+    here is a JavaScript reimplementation of the same checks, speaking the same JSON-RPC over the
+    same WebSocket — same request ids, same failure kinds, same rule that an unprovable requirement
+    fails rather than passes. The connection is made directly from your browser to the node you
+    name; nothing is proxied and no data leaves your machine.`,
+  server: `<strong>This runs the real thing.</strong> Checks are executed server-side by the same
+    Rust binary you would run from a shell — not a reimplementation — and the report below is its
+    output, unmodified. The server dials the node on your behalf, so it will only probe endpoints
+    on the public internet; for a node on your own machine, use the CLI. Switch to
+    <em>JavaScript</em> to run the checks in this tab instead.`,
+};
+
+function setEngine(next) {
+  engine = next;
+  $("disclosure").innerHTML = DISCLOSURE[next];
+  for (const b of document.querySelectorAll(".seg button")) {
+    b.classList.toggle("on", b.dataset.engine === next);
+  }
+  // The server caps how many headers it will sit and wait for.
+  if (next === "server" && backend?.max_follow !== undefined) {
+    const el = $("follow");
+    if ((Number.parseInt(el.value, 10) || 0) > backend.max_follow) el.value = String(backend.max_follow);
+  }
+}
+
+async function detectBackend() {
+  try {
+    const res = await fetch("api/health", { method: "GET" });
+    if (!res.ok) return;
+    const body = await res.json();
+    if (body?.engine !== "rust") return;
+    backend = body;
+    $("engine").hidden = false;
+    setEngine("server");
+  } catch {
+    // No backend here — static hosting. Stay in browser mode silently.
+  }
+}
+
+for (const b of document.querySelectorAll(".seg button")) {
+  b.addEventListener("click", () => { if (!running) setEngine(b.dataset.engine); });
+}
+
+/* Server mode returns one report at the end rather than streaming, so the step
+   rows are reconstructed from it. Derived from the report's own contents — the
+   step that failed is the one the failure kind names, and anything after it was
+   never reached. */
+function stepsFromReport(report, asked) {
+  const reached = (v) => v !== undefined && v !== null;
+  const failed = report.failure;
+
+  const connect = failed === "connect" ? "fail" : "pass";
+  const genesis = connect !== "pass" ? "skip"
+    : failed === "genesis_mismatch" ? "fail"
+    : reached(report.genesis_hash) ? "pass" : "fail";
+  const query = genesis !== "pass" ? "skip"
+    : (reached(report.name) || reached(report.chain) || reached(report.peers) || reached(report.best_block)) ? "pass"
+    : "fail";
+  const require = query !== "pass" ? "skip" : failed === "requirement_unmet" ? "fail" : "pass";
+  const follow = require !== "pass" ? "skip"
+    : !asked.follow ? "off"
+    : reached(report.heads_followed) ? "pass" : "fail";
+
+  setStep("connect", connect, connect === "pass" ? "open" : "failed",
+    connect === "pass" ? "" : report.error ?? "");
+  setStep("genesis", genesis === "skip" ? "skip" : genesis,
+    genesis === "pass" ? `${report.rpc_latency_ms ?? "?"} ms` : genesis === "fail" ? "failed" : "",
+    genesis === "pass"
+      ? (report.genesis_verified
+          ? `${shortHash((report.genesis_hash ?? "").replace(/^0x/, ""))} — matches the hash you required`
+          : `${shortHash((report.genesis_hash ?? "").replace(/^0x/, ""))} — reported only; nothing required, so nothing proven`)
+      : genesis === "fail" ? report.error ?? "" : "Not reached.");
+  setStep("query", query,
+    query === "pass" ? (reached(report.best_block) ? `#${report.best_block.toLocaleString()}` : "no height") : "",
+    query === "pass"
+      ? [report.name, report.chain, report.version && `v${report.version}`,
+         reached(report.peers) ? `${report.peers} peers` : "peer count not reported",
+         report.is_syncing === undefined ? "sync state not reported" : (report.is_syncing ? "syncing" : "synced"),
+        ].filter(Boolean).join(" · ")
+      : "Not reached.");
+  setStep("require", require,
+    require === "pass" ? (asked.bars.length ? "met" : "none set") : require === "fail" ? "failed" : "",
+    require === "pass"
+      ? (asked.bars.length ? `Required ${asked.bars.join(", ")}.` : "No bars set — the exit code only means the node answered.")
+      : require === "fail" ? report.error ?? "" : "Not reached.");
+  setStep("follow", follow === "off" ? "skip" : follow,
+    follow === "pass" ? `${report.heads_followed} / ${asked.follow}` : follow === "off" ? "off" : "",
+    follow === "pass" ? "Unsubscribed."
+      : follow === "off" ? "Set a count above to watch the chain produce blocks."
+      : follow === "fail" ? report.error ?? "" : "Not reached.");
+}
+
+async function probeOnServer(body) {
+  const res = await fetch("api/probe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok && res.status !== 400) {
+    throw new ProbeError("transport", `the probe service answered ${res.status}`);
+  }
+  return res.json();
+}
+
 $("preset").addEventListener("change", (e) => {
   const p = PRESETS[e.target.value];
   if (!p) { $("endpoint").focus(); return; }
@@ -647,6 +779,47 @@ async function probe() {
   let lastHead = null;
 
   setVerdict("running", "Probing…", `${endpoint}`);
+
+  // Server mode: the real binary runs the checks and returns one report.
+  if (engine === "server") {
+    const bars = [
+      minPeers !== null ? `peers ≥ ${minPeers}` : null,
+      requireSynced ? "not syncing" : null,
+    ].filter(Boolean);
+
+    for (const [key] of STEPS) setStep(key, "running");
+
+    let served;
+    try {
+      served = await probeOnServer({
+        endpoint,
+        genesis_hash: $("genesis").value.trim() || null,
+        follow: followCount || null,
+        require_peers: minPeers,
+        require_synced: requireSynced,
+      });
+    } catch (err) {
+      served = { endpoint, ok: false, failure: err.kind ?? "transport", error: err.message };
+    }
+
+    stepsFromReport(served, { follow: followCount, bars });
+
+    if (served.ok) {
+      setVerdict("pass", "Usable",
+        `${served.chain ?? "This node"} · ${served.peers ?? "?"} peers · block ${served.best_block?.toLocaleString() ?? "?"} · ${served.rpc_latency_ms} ms round trip`);
+    } else {
+      setVerdict("fail", "Not usable", served.error ?? "the probe failed", served.failure);
+    }
+
+    clearInterval(elapsedTimer);
+    $("elapsed").textContent = `${((performance.now() - started) / 1000).toFixed(1)}s`;
+    $("run").disabled = false;
+    $("stop").disabled = true;
+    running = false;
+    $("report-json").textContent = JSON.stringify(served, null, 2);
+    $("report").hidden = false;
+    return;
+  }
 
   try {
     let expected = null;
@@ -750,6 +923,7 @@ async function probe() {
 }
 
 renderSteps();
+detectBackend();
 </script>
 </body>
 </html>
