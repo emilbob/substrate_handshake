@@ -11,9 +11,10 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use crate::error::{Failure, ProbeError};
 use crate::rpc::{
-    next_text_frame, NodeStream, Timeouts, ID_CHAIN, ID_GENESIS, ID_HEALTH, ID_NAME, ID_SUBSCRIBE,
-    ID_UNSUBSCRIBE, ID_VERSION,
+    next_text_frame, Deadline, NodeStream, Timeouts, ID_CHAIN, ID_GENESIS, ID_HEADER, ID_HEALTH,
+    ID_NAME, ID_SUBSCRIBE, ID_UNSUBSCRIBE, ID_VERSION,
 };
 
 /// What asking the node for block 0 produced.
@@ -36,6 +37,8 @@ pub(crate) struct NodeInfo {
     pub(crate) peers: Option<u64>,
     pub(crate) is_syncing: Option<bool>,
     pub(crate) should_have_peers: Option<bool>,
+    /// The number of the node's best block, from `chain_getHeader`.
+    pub(crate) best_block: Option<u64>,
 }
 
 /// Parses a hex-encoded 32-byte genesis hash.
@@ -46,18 +49,25 @@ pub(crate) struct NodeInfo {
 ///
 /// # Returns
 ///
-/// The decoded hash, or an error describing why the input was rejected.
-pub(crate) fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+/// The decoded hash, or a message explaining why the input was rejected. The
+/// caller classifies it, because the same bad value means different things
+/// coming from the command line and coming from the node.
+pub(crate) fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], String> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes =
-        hex::decode(hex_str).map_err(|e| format!("genesis hash is not valid hex: {}", e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| format!("genesis hash is not valid hex: {e}"))?;
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
         format!(
             "genesis hash must be 32 bytes (64 hex chars), got {} bytes",
             bytes.len()
         )
-        .into()
     })
+}
+
+/// Reads a `0x`-prefixed hex block number out of a header.
+fn parse_block_number(header: &serde_json::Value) -> Option<u64> {
+    header["number"]
+        .as_str()
+        .and_then(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).ok())
 }
 
 /// Asks the node which chain it is serving, by requesting the hash of block 0.
@@ -70,6 +80,7 @@ pub(crate) fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std:
 /// # Arguments
 ///
 /// * `ws_stream` - The connection to the node.
+/// * `timeouts` - The network waits to apply.
 ///
 /// # Returns
 ///
@@ -77,7 +88,7 @@ pub(crate) fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std:
 pub(crate) async fn fetch_genesis_hash(
     ws_stream: &mut NodeStream,
     timeouts: Timeouts,
-) -> Result<GenesisInfo, Box<dyn std::error::Error>> {
+) -> Result<GenesisInfo, ProbeError> {
     let request = json!({
         "jsonrpc": "2.0",
         "method": "chain_getBlockHash",
@@ -91,8 +102,9 @@ pub(crate) async fn fetch_genesis_hash(
     let sent_at = Instant::now();
     ws_stream.send(Message::Text(request.to_string())).await?;
 
+    let deadline = Deadline::after(timeouts.rpc);
     let response: serde_json::Value = loop {
-        let text = next_text_frame(ws_stream, timeouts.rpc).await?;
+        let text = next_text_frame(ws_stream, deadline).await?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if value["id"].as_u64() == Some(ID_GENESIS) {
             break value;
@@ -102,14 +114,17 @@ pub(crate) async fn fetch_genesis_hash(
     let latency = sent_at.elapsed();
 
     if let Some(error) = response.get("error") {
-        return Err(format!("node rejected chain_getBlockHash: {error}").into());
+        return Err(ProbeError::rpc(format!(
+            "node rejected chain_getBlockHash: {error}"
+        )));
     }
 
-    let reported = response["result"]
-        .as_str()
-        .ok_or("chain_getBlockHash returned no block hash — is block 0 available?")?;
-    let reported = parse_genesis_hash(reported)
-        .map_err(|e| format!("node reported an unusable genesis hash: {e}"))?;
+    let reported = response["result"].as_str().ok_or_else(|| {
+        ProbeError::protocol("chain_getBlockHash returned no block hash — is block 0 available?")
+    })?;
+    let reported = parse_genesis_hash(reported).map_err(|e| {
+        ProbeError::protocol(format!("node reported an unusable genesis hash: {e}"))
+    })?;
 
     Ok(GenesisInfo {
         hash: reported,
@@ -137,14 +152,16 @@ pub(crate) async fn fetch_genesis_hash(
 pub(crate) fn verify_genesis_hash(
     reported: [u8; 32],
     expected: Option<&[u8; 32]>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, ProbeError> {
     match expected {
-        Some(expected) if reported != *expected => Err(format!(
-            "genesis hash mismatch — expected {}, node reports {}",
-            hex::encode(expected),
-            hex::encode(reported)
-        )
-        .into()),
+        Some(expected) if reported != *expected => Err(ProbeError::new(
+            Failure::GenesisMismatch,
+            format!(
+                "genesis hash mismatch — expected {}, node reports {}",
+                hex::encode(expected),
+                hex::encode(reported)
+            ),
+        )),
         Some(_) => {
             info!("Genesis hash verified: 0x{}", hex::encode(reported));
             Ok(true)
@@ -159,14 +176,15 @@ pub(crate) fn verify_genesis_hash(
     }
 }
 
-/// Queries node identity and health from the Substrate node.
+/// Queries node identity, health and current height from the Substrate node.
 ///
-/// All four calls are sent before any reply is read, so the node answers them
-/// in parallel and the whole step costs one round trip rather than four.
+/// All five calls are sent before any reply is read, so the node answers them
+/// in parallel and the whole step costs one round trip rather than five.
 ///
 /// # Arguments
 ///
 /// * `ws_stream` - The connection to the node.
+/// * `timeouts` - The network waits to apply.
 ///
 /// # Returns
 ///
@@ -176,7 +194,7 @@ pub(crate) fn verify_genesis_hash(
 pub(crate) async fn query_node_info(
     ws_stream: &mut NodeStream,
     timeouts: Timeouts,
-) -> Result<NodeInfo, Box<dyn std::error::Error>> {
+) -> Result<NodeInfo, ProbeError> {
     let requests = vec![
         json!({
             "jsonrpc": "2.0",
@@ -205,6 +223,14 @@ pub(crate) async fn query_node_info(
             "params": [],
             "id": ID_HEALTH,
         }),
+        // With no params this returns the *best* header, which is how the probe
+        // answers "is this node stuck?" without opening a subscription.
+        json!({
+            "jsonrpc": "2.0",
+            "method": "chain_getHeader",
+            "params": [],
+            "id": ID_HEADER,
+        }),
     ];
 
     // Track the ids we are still waiting on, so that a response — successful or
@@ -221,17 +247,19 @@ pub(crate) async fn query_node_info(
     }
 
     let mut info = NodeInfo::default();
+    // One budget for the whole step. The calls are pipelined, so they should all
+    // land together; a node that dribbles unrelated frames must not be able to
+    // hold the probe open by resetting a per-frame clock.
+    let deadline = Deadline::after(timeouts.rpc);
 
     while !pending.is_empty() {
-        let text = next_text_frame(ws_stream, timeouts.rpc)
-            .await
-            .map_err(|e| {
-                format!(
-                    "{e} ({} request(s) unanswered: {:?})",
-                    pending.len(),
-                    pending
-                )
-            })?;
+        let text = next_text_frame(ws_stream, deadline).await.map_err(|e| {
+            e.context(format!(
+                "({} request(s) unanswered: {:?})",
+                pending.len(),
+                pending
+            ))
+        })?;
 
         let response: serde_json::Value = serde_json::from_str(&text)?;
         match response["id"].as_u64() {
@@ -280,6 +308,13 @@ fn record_response(info: &mut NodeInfo, id: u64, result: &serde_json::Value) {
                 info.is_syncing
             );
         }
+        ID_HEADER => {
+            info.best_block = parse_block_number(result);
+            match info.best_block {
+                Some(number) => info!("Best block: #{number}"),
+                None => error!("chain_getHeader returned an unreadable block number: {result}"),
+            }
+        }
         _ => error!("No handler for request id {id}"),
     }
 }
@@ -297,6 +332,7 @@ fn record_response(info: &mut NodeInfo, id: u64, result: &serde_json::Value) {
 ///
 /// * `ws_stream` - The connection to the node.
 /// * `count` - How many headers to observe before unsubscribing.
+/// * `timeouts` - The network waits to apply.
 ///
 /// # Returns
 ///
@@ -306,7 +342,7 @@ pub(crate) async fn follow_new_heads(
     ws_stream: &mut NodeStream,
     count: u64,
     timeouts: Timeouts,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<u64, ProbeError> {
     let request = json!({
         "jsonrpc": "2.0",
         "method": "chain_subscribeNewHeads",
@@ -319,48 +355,55 @@ pub(crate) async fn follow_new_heads(
     // The subscription id arrives as the reply to the subscribe call; every
     // later notification carries it, which is how concurrent subscriptions on
     // one connection are told apart.
+    let deadline = Deadline::after(timeouts.rpc);
     let subscription_id = loop {
-        let text = next_text_frame(ws_stream, timeouts.rpc).await?;
+        let text = next_text_frame(ws_stream, deadline).await?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
         if value["id"].as_u64() != Some(ID_SUBSCRIBE) {
             continue;
         }
         if let Some(error) = value.get("error") {
-            return Err(format!("node rejected chain_subscribeNewHeads: {error}").into());
+            return Err(ProbeError::rpc(format!(
+                "node rejected chain_subscribeNewHeads: {error}"
+            )));
         }
         break value["result"]
             .as_str()
-            .ok_or("subscription returned no id")?
+            .ok_or_else(|| ProbeError::protocol("subscription returned no id"))?
             .to_string();
     };
     info!("Subscribed with id {subscription_id}");
 
     let mut seen = 0;
     while seen < count {
-        // A block is not a reply, so this waits on the chain's block time
-        // rather than on the node's responsiveness.
-        let text = next_text_frame(ws_stream, timeouts.head)
-            .await
-            .map_err(|e| format!("{e} (saw {seen} of {count} headers)"))?;
-        let value: serde_json::Value = serde_json::from_str(&text)?;
+        // A fresh budget per header: each block legitimately takes up to the
+        // chain's block time, but no single one may be stretched indefinitely by
+        // unrelated frames arriving in between.
+        let deadline = Deadline::after(timeouts.head);
 
-        if value["method"].as_str() != Some("chain_newHead")
-            || value["params"]["subscription"].as_str() != Some(&subscription_id)
-        {
-            continue;
+        loop {
+            let text = next_text_frame(ws_stream, deadline)
+                .await
+                .map_err(|e| e.context(format!("(saw {seen} of {count} headers)")))?;
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+
+            if value["method"].as_str() != Some("chain_newHead")
+                || value["params"]["subscription"].as_str() != Some(&subscription_id)
+            {
+                continue;
+            }
+
+            let header = &value["params"]["result"];
+            match parse_block_number(header) {
+                Some(number) => info!(
+                    "New head #{number} parent={}",
+                    header["parentHash"].as_str().unwrap_or("?")
+                ),
+                None => error!("New head with unreadable block number: {header}"),
+            }
+            break;
         }
 
-        let header = &value["params"]["result"];
-        let number = header["number"]
-            .as_str()
-            .and_then(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).ok());
-        match number {
-            Some(number) => info!(
-                "New head #{number} parent={}",
-                header["parentHash"].as_str().unwrap_or("?")
-            ),
-            None => error!("New head with unreadable block number: {header}"),
-        }
         seen += 1;
     }
 
@@ -390,7 +433,7 @@ mod tests {
         ws_stream: &mut NodeStream,
         expected: Option<&[u8; 32]>,
         timeouts: Timeouts,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, ProbeError> {
         let genesis = fetch_genesis_hash(ws_stream, timeouts).await?;
         verify_genesis_hash(genesis.hash, expected)
     }
@@ -439,9 +482,12 @@ mod tests {
 
         let err = check_genesis_hash(&mut ws, Some(&expected), fast())
             .await
-            .expect_err("a different chain must not be accepted")
-            .to_string();
-        assert!(err.contains("mismatch"), "unhelpful error: {err}");
+            .expect_err("a different chain must not be accepted");
+        assert_eq!(err.kind(), Failure::GenesisMismatch);
+        assert!(
+            err.to_string().contains("mismatch"),
+            "unhelpful error: {err}"
+        );
     }
 
     /// Without `--genesis-hash` there is nothing to enforce, so any chain is
@@ -466,9 +512,10 @@ mod tests {
         .await;
 
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
-        assert!(check_genesis_hash(&mut ws, Some(&expected), fast())
+        let err = check_genesis_hash(&mut ws, Some(&expected), fast())
             .await
-            .is_err());
+            .expect_err("a refused call is not a pass");
+        assert_eq!(err.kind(), Failure::RpcError);
     }
 
     /// A node that accepts the socket and then says nothing must not hang the
@@ -485,9 +532,45 @@ mod tests {
         let expected = parse_genesis_hash(VALID_HASH).unwrap();
         let err = check_genesis_hash(&mut ws, Some(&expected), fast())
             .await
-            .expect_err("a silent node must time out")
-            .to_string();
-        assert!(err.contains("no response"), "unhelpful error: {err}");
+            .expect_err("a silent node must time out");
+        assert_eq!(err.kind(), Failure::Timeout);
+    }
+
+    /// The reason reads are bounded by a shared deadline rather than one clock
+    /// per frame: a node that chatters just fast enough would otherwise reset
+    /// the wait forever — every individual read inside the limit, the total
+    /// unbounded. Wrapped in an outer timeout so a regression fails the test
+    /// instead of hanging the suite.
+    #[tokio::test]
+    async fn unrelated_frames_cannot_extend_the_wait() {
+        let mut ws = mock_node(|mut ws| async move {
+            ws.next().await;
+            // Never the response we asked for, arriving faster than the budget.
+            loop {
+                if ws
+                    .send(Message::Text(r#"{"jsonrpc":"2.0","id":999}"#.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        let expected = parse_genesis_hash(VALID_HASH).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            check_genesis_hash(&mut ws, Some(&expected), fast()),
+        )
+        .await
+        .expect("a chattering node must not hold the probe open indefinitely");
+
+        assert_eq!(
+            outcome.expect_err("noise is not an answer").kind(),
+            Failure::Timeout
+        );
     }
 
     /// Serves a new-heads subscription: confirms it, pushes `heads` headers
@@ -514,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn follows_the_requested_number_of_heads() {
         let mut ws = mock_node(|ws| serve_new_heads(ws, 3)).await;
-        assert!(follow_new_heads(&mut ws, 3, fast()).await.is_ok());
+        assert_eq!(follow_new_heads(&mut ws, 3, fast()).await.unwrap(), 3);
     }
 
     /// Notifications for a different subscription must not count — one
@@ -564,9 +647,12 @@ mod tests {
 
         let err = follow_new_heads(&mut ws, 1, fast())
             .await
-            .expect_err("a refused subscription must not look like success")
-            .to_string();
-        assert!(err.contains("rejected"), "unhelpful error: {err}");
+            .expect_err("a refused subscription must not look like success");
+        assert_eq!(err.kind(), Failure::RpcError);
+        assert!(
+            err.to_string().contains("rejected"),
+            "unhelpful error: {err}"
+        );
     }
 
     /// A chain that stalls mid-subscription must time out, and the error must
@@ -577,17 +663,20 @@ mod tests {
 
         let err = follow_new_heads(&mut ws, 3, fast())
             .await
-            .expect_err("a stalled chain must time out")
-            .to_string();
-        assert!(err.contains("saw 1 of 3"), "unhelpful error: {err}");
+            .expect_err("a stalled chain must time out");
+        assert_eq!(err.kind(), Failure::Timeout);
+        assert!(
+            err.to_string().contains("saw 1 of 3"),
+            "unhelpful error: {err}"
+        );
     }
 
-    /// The node hangs up after answering only one of the four requests. The
+    /// The node hangs up after answering only one of the five requests. The
     /// terminated stream must surface an error, not spin on `None` forever.
     #[tokio::test]
     async fn hangup_errors_instead_of_spinning() {
         let mut ws = mock_node(|mut ws| async move {
-            take_requests(&mut ws, 4).await;
+            take_requests(&mut ws, 5).await;
             ws.send(Message::Text(
                 r#"{"jsonrpc":"2.0","id":1,"result":"node"}"#.into(),
             ))
@@ -597,10 +686,10 @@ mod tests {
         })
         .await;
 
-        assert!(
-            query_node_info(&mut ws, fast()).await.is_err(),
-            "early hangup should surface an error"
-        );
+        let err = query_node_info(&mut ws, fast())
+            .await
+            .expect_err("early hangup should surface an error");
+        assert_eq!(err.kind(), Failure::Transport);
     }
 
     /// Every request is answered with a JSON-RPC error. Errors still retire the
@@ -608,7 +697,10 @@ mod tests {
     #[tokio::test]
     async fn all_error_responses_still_terminate() {
         let mut ws = mock_node(|mut ws| async move {
-            for id in 1..=4 {
+            // Keyed off the constants rather than a range: the query ids are not
+            // contiguous, and a mock that answers the wrong ones would look like
+            // a client bug.
+            for id in [ID_NAME, ID_CHAIN, ID_VERSION, ID_HEALTH, ID_HEADER] {
                 ws.next().await;
                 ws.send(Message::Text(format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32601}}}}"#
@@ -625,12 +717,13 @@ mod tests {
         assert_eq!(info, NodeInfo::default(), "nothing was actually reported");
     }
 
-    /// Answers all four identity/health calls, keyed by request id so the
+    /// Answers all five identity/health/height calls, keyed by request id so the
     /// out-of-order case the client is built for is exercised (health first).
-    async fn serve_node_info(mut ws: WebSocketStream<TcpStream>, health: &str) {
+    async fn serve_node_info(mut ws: WebSocketStream<TcpStream>, health: &str, header: &str) {
         let replies = [
             (ID_HEALTH, health.to_string()),
             (ID_VERSION, r#""1.24.0""#.to_string()),
+            (ID_HEADER, header.to_string()),
             (ID_NAME, r#""Parity Polkadot""#.to_string()),
             (ID_CHAIN, r#""Polkadot""#.to_string()),
         ];
@@ -645,15 +738,13 @@ mod tests {
         ws.next().await;
     }
 
+    /// A healthy node, for tests that care about one field in isolation.
+    const HEALTHY: &str = r#"{"peers":42,"isSyncing":false,"shouldHavePeers":true}"#;
+    const AT_BLOCK_100: &str = r#"{"number":"0x64","parentHash":"0xdead"}"#;
+
     #[tokio::test]
-    async fn query_reports_identity_and_health() {
-        let mut ws = mock_node(|ws| {
-            serve_node_info(
-                ws,
-                r#"{"peers":42,"isSyncing":false,"shouldHavePeers":true}"#,
-            )
-        })
-        .await;
+    async fn query_reports_identity_health_and_height() {
+        let mut ws = mock_node(|ws| serve_node_info(ws, HEALTHY, AT_BLOCK_100)).await;
 
         let info = query_node_info(&mut ws, fast()).await.unwrap();
         assert_eq!(
@@ -665,8 +756,20 @@ mod tests {
                 peers: Some(42),
                 is_syncing: Some(false),
                 should_have_peers: Some(true),
+                best_block: Some(100),
             }
         );
+    }
+
+    /// The height is what answers "is this node stuck?", so a header the probe
+    /// cannot read must leave it empty rather than guess at zero.
+    #[tokio::test]
+    async fn unreadable_header_leaves_the_height_empty() {
+        let mut ws = mock_node(|ws| serve_node_info(ws, HEALTHY, r#"{"parentHash":"0x0"}"#)).await;
+
+        let info = query_node_info(&mut ws, fast()).await.unwrap();
+        assert_eq!(info.best_block, None);
+        assert_eq!(info.peers, Some(42), "the rest of the report survived");
     }
 
     /// `system_health` is not exposed everywhere. A node that refuses it is
@@ -674,11 +777,12 @@ mod tests {
     #[tokio::test]
     async fn refused_health_call_leaves_identity_intact() {
         let mut ws = mock_node(|mut ws| async move {
-            take_requests(&mut ws, 4).await;
+            take_requests(&mut ws, 5).await;
             for (id, body) in [
                 (ID_NAME, r#""result":"Parity Polkadot""#),
                 (ID_CHAIN, r#""result":"Polkadot""#),
                 (ID_VERSION, r#""result":"1.24.0""#),
+                (ID_HEADER, r#""result":{"number":"0x64"}"#),
                 (ID_HEALTH, r#""error":{"code":-32601}"#),
             ] {
                 ws.send(Message::Text(format!(
@@ -693,6 +797,7 @@ mod tests {
 
         let info = query_node_info(&mut ws, fast()).await.unwrap();
         assert_eq!(info.chain.as_deref(), Some("Polkadot"), "identity survived");
+        assert_eq!(info.best_block, Some(100), "height survived");
         assert_eq!(info.peers, None, "a refused call reports nothing");
         assert_eq!(info.is_syncing, None);
     }
@@ -701,7 +806,8 @@ mod tests {
     /// node did not say" and "the node has no peers" mean opposite things.
     #[tokio::test]
     async fn partial_health_result_does_not_invent_values() {
-        let mut ws = mock_node(|ws| serve_node_info(ws, r#"{"isSyncing":true}"#)).await;
+        let mut ws =
+            mock_node(|ws| serve_node_info(ws, r#"{"isSyncing":true}"#, AT_BLOCK_100)).await;
 
         let info = query_node_info(&mut ws, fast()).await.unwrap();
         assert_eq!(info.is_syncing, Some(true));

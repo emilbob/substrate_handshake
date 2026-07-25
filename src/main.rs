@@ -5,6 +5,7 @@
 //! themselves live in [`probe`], the connection in [`rpc`], and the findings in
 //! [`report`].
 
+mod error;
 mod probe;
 mod report;
 mod rpc;
@@ -15,12 +16,14 @@ mod test_support;
 use clap::Parser;
 use env_logger::Env;
 use log::{error, info};
+use std::time::Duration;
 
+use error::ProbeError;
 use probe::{
     fetch_genesis_hash, follow_new_heads, parse_genesis_hash, query_node_info, verify_genesis_hash,
 };
 use report::{check_requirements, ProbeReport};
-use rpc::Timeouts;
+use rpc::{Timeouts, CONNECT_TIMEOUT, RPC_TIMEOUT, SUBSCRIPTION_TIMEOUT};
 
 /// Connect to a Substrate node, verify which chain it serves, and query its
 /// identity over JSON-RPC.
@@ -58,6 +61,32 @@ struct Opt {
     /// straight into `jq`.
     #[arg(long)]
     json: bool,
+
+    /// Seconds to allow for the connection to be established.
+    #[arg(long, value_name = "SECS", default_value_t = CONNECT_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    connect_timeout: u64,
+
+    /// Seconds to allow the node to answer a request. Bounds each step as a
+    /// whole, so a node dribbling unrelated frames cannot extend it.
+    #[arg(long, value_name = "SECS", default_value_t = RPC_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    rpc_timeout: u64,
+
+    /// Seconds to allow for each pushed block header under `--follow`. Far
+    /// longer than the RPC wait by default: this waits on the chain's block
+    /// time, not on the node being responsive. Raise it for a slow parachain.
+    #[arg(long, value_name = "SECS", default_value_t = SUBSCRIPTION_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..))]
+    head_timeout: u64,
+}
+
+impl Opt {
+    /// The network waits this invocation asked for.
+    fn timeouts(&self) -> Timeouts {
+        Timeouts {
+            connect: Duration::from_secs(self.connect_timeout),
+            rpc: Duration::from_secs(self.rpc_timeout),
+            head: Duration::from_secs(self.head_timeout),
+        }
+    }
 }
 
 /// Connects to the node, verifies its chain identity and queries node info.
@@ -75,18 +104,15 @@ struct Opt {
 /// # Returns
 ///
 /// A Result indicating the success or failure of the run.
-async fn run(
-    opt: &Opt,
-    timeouts: Timeouts,
-    report: &mut ProbeReport,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(opt: &Opt, timeouts: Timeouts, report: &mut ProbeReport) -> Result<(), ProbeError> {
     let expected_genesis = opt
         .genesis_hash
         .as_deref()
         .map(parse_genesis_hash)
-        .transpose()?;
+        .transpose()
+        .map_err(|e| ProbeError::config(format!("--genesis-hash is unusable: {e}")))?;
 
-    let mut ws_stream = rpc::connect(&opt.node_address).await?;
+    let mut ws_stream = rpc::connect(&opt.node_address, timeouts.connect).await?;
 
     // Recorded before the comparison, so a mismatch is reported alongside the
     // hash that caused it rather than only in the error text.
@@ -102,6 +128,7 @@ async fn run(
     report.peers = info.peers;
     report.is_syncing = info.is_syncing;
     report.should_have_peers = info.should_have_peers;
+    report.best_block = info.best_block;
     info!("Node information queried!");
 
     // Judged before `--follow`, which can block for as long as the chain takes
@@ -138,10 +165,13 @@ async fn main() {
         ..Default::default()
     };
 
-    let result = run(&opt, Timeouts::default(), &mut report).await;
+    let result = run(&opt, opt.timeouts(), &mut report).await;
     match &result {
         Ok(()) => report.ok = true,
-        Err(e) => report.error = Some(e.to_string()),
+        Err(e) => {
+            report.failure = Some(e.kind());
+            report.error = Some(e.to_string());
+        }
     }
 
     // Printed on failure too: a probe that emits nothing precisely when the node
@@ -192,13 +222,16 @@ mod tests {
             require_peers: Some(1),
             require_synced: true,
             json: false,
+            connect_timeout: CONNECT_TIMEOUT.as_secs(),
+            rpc_timeout: RPC_TIMEOUT.as_secs(),
+            head_timeout: SUBSCRIPTION_TIMEOUT.as_secs(),
         };
 
         let mut report = ProbeReport {
             endpoint: opt.node_address.clone(),
             ..Default::default()
         };
-        let result = run(&opt, Timeouts::default(), &mut report).await;
+        let result = run(&opt, opt.timeouts(), &mut report).await;
 
         assert!(
             result.is_ok(),
@@ -216,6 +249,28 @@ mod tests {
             "system_health reported no peers: {report:#?}"
         );
         assert_eq!(report.is_syncing, Some(false));
+        assert!(
+            report.best_block.unwrap_or(0) > 0,
+            "chain_getHeader gave no height: {report:#?}"
+        );
         assert_eq!(report.heads_followed, Some(1), "no header was pushed");
+    }
+
+    /// The CLI is a contract too. A zero timeout would make every run fail
+    /// instantly, which is never what someone means by asking for one.
+    #[test]
+    fn timeout_flags_reject_zero() {
+        assert!(
+            Opt::try_parse_from(["substrate-node-probe", "--rpc-timeout", "0"]).is_err(),
+            "a zero RPC timeout must not be accepted"
+        );
+        let opt = Opt::try_parse_from(["substrate-node-probe", "--rpc-timeout", "3"])
+            .expect("a positive timeout is valid");
+        assert_eq!(opt.timeouts().rpc, Duration::from_secs(3));
+        assert_eq!(
+            opt.timeouts().head,
+            SUBSCRIPTION_TIMEOUT,
+            "unset flags keep their defaults"
+        );
     }
 }
