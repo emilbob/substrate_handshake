@@ -72,7 +72,17 @@ INFO  Unsubscribed after 3 header(s)
 
 This talks to a node's **RPC endpoint**, not its peer-to-peer port. Verifying the genesis hash confirms *which chain* you are connected to; it is not peer authentication, which is a libp2p protocol on port 30333 requiring Noise, multistream-select and yamux.
 
-The `HandshakeMessage` struct in `src/main.rs` is a worked example of SCALE encoding — Substrate's wire codec — kept with a round-trip test. It is deliberately not sent to the node, because an RPC endpoint has no notion of it.
+The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE encoding — Substrate's wire codec — kept with a round-trip test. It is deliberately not sent to the node, because an RPC endpoint has no notion of it.
+
+## Layout
+
+| File | Holds |
+| --- | --- |
+| `src/main.rs` | The CLI flags, and the order the steps run in. |
+| `src/rpc.rs` | The transport: opening the WebSocket, request ids, timeouts, reading frames. Knows nothing about chains. |
+| `src/probe.rs` | The JSON-RPC calls — genesis hash, identity and health, following heads. |
+| `src/report.rs` | The findings, their JSON shape, and the `--require-*` checks. |
+| `src/scale.rs` | The SCALE codec example. |
 
 ## Requirements
 
