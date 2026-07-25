@@ -19,7 +19,22 @@ INFO  Node information queried!
 1. **Connects** to the node's JSON-RPC endpoint over WebSocket (`ws://` or `wss://`).
 2. **Checks chain identity** by asking for the hash of block 0 via `chain_getBlockHash` and comparing it to the `--genesis-hash` you supplied. A node on a different chain is rejected and the client exits non-zero without querying anything further.
 3. **Queries node information** — `system_name`, `system_chain` and `system_version` — matching each response to its request by JSON-RPC id, since nodes are free to answer out of order (and do).
-4. **Logs** every step through `env_logger`, so `RUST_LOG=debug` shows the full exchange.
+4. **Follows new blocks**, optionally — with `--follow N` it subscribes via `chain_subscribeNewHeads`, reports headers as the node pushes them, then unsubscribes.
+5. **Logs** every step through `env_logger`, so `RUST_LOG=debug` shows the full exchange.
+
+### Why WebSocket
+
+Steps 1–3 don't need it — request/response would work as well over HTTP POST. `--follow` is the part that does: a subscription has the node push frames unprompted for as long as the connection lives, which is what the transport is actually for.
+
+```
+$ cargo run -- --node-address wss://rpc.polkadot.io --follow 3
+
+INFO  Subscribed with id JfjLVdZ5TGesJIVX
+INFO  New head #32263282 parent=0xb2ddbc8a89c37c57b07136cf2c997c8074b0c7de309f19eae00a990c2e3bfe8c
+INFO  New head #32263283 parent=0x52aa1f4c48e680c82f9a5838f8e1f16f546e427b03c842e572e4b3225713e766
+INFO  New head #32263284 parent=0x0e0c80ba8389731ff05c28a2810a3093d018216b12bbe2fd11cc70982c093397
+INFO  Unsubscribed after 3 header(s)
+```
 
 ### What it is not
 
@@ -42,6 +57,7 @@ cargo run -- [--node-address <url>] [--genesis-hash <hex>]
 | --- | --- | --- |
 | `--node-address` | `ws://127.0.0.1:9944` | WebSocket RPC endpoint. `wss://` is supported. |
 | `--genesis-hash` | *(none)* | Hash the node must report, with or without a `0x` prefix. Omit to report the node's genesis hash without enforcing one. |
+| `--follow <COUNT>` | *(none)* | Follow this many new block headers after querying, then unsubscribe and exit. Omit to exit straight after the query. |
 
 Exit code is `0` on success and `1` on any failure, including a genesis mismatch, so it is usable as a health check in scripts.
 
@@ -93,4 +109,4 @@ Tests run against an in-process mock WebSocket node, so they need no network and
 ## Notes
 
 - TLS uses `rustls` with the `ring` provider, so the build needs no OpenSSL system libraries.
-- Both the connect and per-response paths are bounded by a 10-second timeout; a node that accepts the socket and goes silent produces an error rather than a hang.
+- Both the connect and per-response paths are bounded by a 10-second timeout; a node that accepts the socket and goes silent produces an error rather than a hang. Waiting for a pushed block header uses a separate, much longer bound (120s), since that waits on the chain's block time rather than on the node being responsive.
