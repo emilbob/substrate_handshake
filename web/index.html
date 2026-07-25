@@ -231,7 +231,8 @@
     JavaScript reimplementation of the same checks, speaking the same JSON-RPC over the same
     WebSocket — same request ids, same failure kinds, same rule that an unprovable requirement
     fails rather than passes. The connection is made directly from your browser to the node you
-    name; nothing is proxied and no data leaves your machine.
+    name; nothing is proxied and no data leaves your machine. To run the actual binary instead,
+    use <a href="https://substrate-node-probe.onrender.com/">the deployment that hosts it</a>.
   </p>
 
   <form class="controls" id="form">
@@ -636,7 +637,8 @@ const DISCLOSURE = {
     here is a JavaScript reimplementation of the same checks, speaking the same JSON-RPC over the
     same WebSocket — same request ids, same failure kinds, same rule that an unprovable requirement
     fails rather than passes. The connection is made directly from your browser to the node you
-    name; nothing is proxied and no data leaves your machine.`,
+    name; nothing is proxied and no data leaves your machine. To run the actual binary instead, use
+    <a href="https://substrate-node-probe.onrender.com/">the deployment that hosts it</a>.`,
   server: `<strong>This runs the real thing.</strong> Checks are executed server-side by the same
     Rust binary you would run from a shell — not a reimplementation — and the report below is its
     output, unmodified. The server dials the node on your behalf, so it will only probe endpoints
