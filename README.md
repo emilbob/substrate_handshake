@@ -102,6 +102,18 @@ This talks to a node's **RPC endpoint**, not its peer-to-peer port. Verifying th
 
 The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE encoding — Substrate's wire codec — kept with a round-trip test. It is deliberately not sent to the node, because an RPC endpoint has no notion of it.
 
+## Try it in a browser
+
+[`web/index.html`](web/index.html) runs the same checks against a live node from a browser, with the results filling in as they resolve. It is a **JavaScript reimplementation**, not this binary — a browser cannot execute a Rust program — but it speaks the same JSON-RPC, uses the same request ids and failure kinds, and applies the same rule that an unprovable requirement fails rather than passes.
+
+It is a single self-contained file with no build step:
+
+```bash
+python3 -m http.server -d web 8000    # then open http://127.0.0.1:8000
+```
+
+To publish it, point GitHub Pages at the `web/` directory, or drop the file on any static host. Note that a page served over `https` cannot open a `ws://` connection to `127.0.0.1` — browsers block that as mixed content — so probing a local dev node means opening the file from disk, or using the CLI.
+
 ## Layout
 
 | File | Holds |
@@ -112,6 +124,7 @@ The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE enc
 | `src/report.rs` | The findings, their JSON shape, and the `--require-*` checks. |
 | `src/error.rs` | The failure taxonomy. |
 | `src/scale.rs` | The SCALE codec example. |
+| `web/index.html` | The browser version — same checks, different language. |
 
 ## Requirements
 
