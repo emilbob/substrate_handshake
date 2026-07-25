@@ -135,6 +135,11 @@
 
   /* Engine switch — only shown when a real backend answered /api/health. */
   .engine { display: inline-flex; align-items: center; gap: 0.6rem; }
+  /* Any `display` here would override what the `hidden` attribute does, leaving
+     a static host showing an engine switch set to "Rust" while JavaScript is
+     what actually runs — the page contradicting itself about the one thing it
+     must not be wrong about. */
+  .engine[hidden] { display: none; }
   .seg { display: inline-flex; border: 1px solid var(--rule-strong); border-radius: 2px; overflow: hidden; }
   .seg button {
     font-family: var(--mono); font-size: var(--step--1); font-weight: 600;
@@ -273,9 +278,12 @@
       <button type="button" class="ghost" id="stop" disabled>Stop</button>
       <span class="engine" id="engine" hidden>
         <span class="label">Engine</span>
+        <!-- JavaScript is marked active in the markup because that is what runs
+             before anything answers /api/health. The switch flips to Rust only
+             once a backend has actually confirmed it is there. -->
         <span class="seg">
-          <button type="button" data-engine="server" class="on">Rust</button>
-          <button type="button" data-engine="browser">JavaScript</button>
+          <button type="button" data-engine="server">Rust</button>
+          <button type="button" data-engine="browser" class="on">JavaScript</button>
         </span>
       </span>
       <span class="elapsed" id="elapsed"></span>
