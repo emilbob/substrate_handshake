@@ -3,15 +3,27 @@ use env_logger::Env;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
 use parity_scale_codec::{Decode, Encode};
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 /// The client's end of the WebSocket connection to the node.
 type NodeStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// JSON-RPC request ids, allocated here rather than per function because they
+/// share one connection: responses are matched by id, so a subscription must
+/// not reuse the id of a query that may still be outstanding.
+const ID_GENESIS: u64 = 0;
+const ID_NAME: u64 = 1;
+const ID_CHAIN: u64 = 2;
+const ID_VERSION: u64 = 3;
+const ID_HEALTH: u64 = 4;
+const ID_SUBSCRIBE: u64 = 5;
+const ID_UNSUBSCRIBE: u64 = 6;
 
 /// How long to wait for the WebSocket connection to be established.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,6 +53,74 @@ impl Default for Timeouts {
             head: SUBSCRIPTION_TIMEOUT,
         }
     }
+}
+
+/// Everything the probe learned about the node, and the exact shape `--json`
+/// prints to stdout.
+///
+/// Absent fields are omitted rather than serialised as `null`, so a consumer can
+/// tell "the node did not answer this" from "the node answered with nothing".
+/// The report is filled in as the run progresses and is printed even when the
+/// run fails, because a monitor wants to know how far the probe got.
+#[derive(Debug, Default, Serialize)]
+struct ProbeReport {
+    /// The endpoint that was probed.
+    endpoint: String,
+    /// Whether every step succeeded. `false` means `error` is set.
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// The genesis hash the node reported, `0x`-prefixed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genesis_hash: Option<String>,
+    /// True only when `--genesis-hash` was supplied *and* matched. Without the
+    /// flag the hash above is reported but nothing is proven about it.
+    genesis_verified: bool,
+    /// Round-trip time of the `chain_getBlockHash` call — one honest latency
+    /// sample, taken before the pipelined queries muddy the measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rpc_latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// Connected peers, from `system_health`. Zero on a live network means the
+    /// node is isolated, which is the failure this probe exists to catch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_syncing: Option<bool>,
+    /// False for a dev chain running alone, which is why `peers: 0` is only
+    /// alarming when this is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    should_have_peers: Option<bool>,
+    /// How many headers `--follow` observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heads_followed: Option<u64>,
+}
+
+/// What asking the node for block 0 produced.
+#[derive(Debug)]
+struct GenesisInfo {
+    /// The hash the node reported.
+    hash: [u8; 32],
+    /// How long the node took to answer.
+    latency: Duration,
+}
+
+/// What the node said about itself. Every field is optional: a node may reject
+/// any single call — `system_health` in particular is not universally exposed —
+/// and one refused query should not sink the whole probe.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NodeInfo {
+    name: Option<String>,
+    chain: Option<String>,
+    version: Option<String>,
+    peers: Option<u64>,
+    is_syncing: Option<bool>,
+    should_have_peers: Option<bool>,
 }
 
 /// A SCALE-encoded handshake message, kept as a worked example of Substrate's
@@ -119,47 +199,46 @@ async fn next_text_frame(
     }
 }
 
-/// Checks which chain the node is serving.
+/// Asks the node which chain it is serving, by requesting the hash of block 0.
 ///
-/// Asks the node for the hash of block 0. When `expected` is given this is the
-/// client's actual authenticity check: a node on a different chain — or an
-/// endpoint that is not the intended one — reports a different genesis hash and
-/// is rejected. When `expected` is `None` the hash is only reported, which is
-/// what you want against a local dev chain whose genesis varies per chainspec.
+/// Kept separate from [`verify_genesis_hash`] so that a mismatch can still be
+/// reported *with* the hash the node gave: on the failure this check exists to
+/// catch, "which chain is this really?" is the thing the caller most wants, and
+/// it should not have to be parsed back out of an error message.
 ///
 /// # Arguments
 ///
 /// * `ws_stream` - The connection to the node.
-/// * `expected` - The genesis hash the caller requires, if any.
 ///
 /// # Returns
 ///
-/// A Result that is an error if the hashes differ or the node cannot answer.
-async fn check_genesis_hash(
+/// The hash the node reported and how long it took to answer.
+async fn fetch_genesis_hash(
     ws_stream: &mut NodeStream,
-    expected: Option<&[u8; 32]>,
     timeouts: Timeouts,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const REQUEST_ID: u64 = 0;
-
+) -> Result<GenesisInfo, Box<dyn std::error::Error>> {
     let request = json!({
         "jsonrpc": "2.0",
         "method": "chain_getBlockHash",
         "params": [0],
-        "id": REQUEST_ID,
+        "id": ID_GENESIS,
     });
 
     info!("Verifying genesis hash: {}", request);
+    // Timed here rather than around the whole function so the sample covers the
+    // node's round trip and not our own JSON handling.
+    let sent_at = Instant::now();
     ws_stream.send(Message::Text(request.to_string())).await?;
 
     let response: serde_json::Value = loop {
         let text = next_text_frame(ws_stream, timeouts.rpc).await?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
-        if value["id"].as_u64() == Some(REQUEST_ID) {
+        if value["id"].as_u64() == Some(ID_GENESIS) {
             break value;
         }
         error!("Ignoring unexpected frame while verifying genesis hash: {value}");
     };
+    let latency = sent_at.elapsed();
 
     if let Some(error) = response.get("error") {
         return Err(format!("node rejected chain_getBlockHash: {error}").into());
@@ -171,6 +250,33 @@ async fn check_genesis_hash(
     let reported = parse_genesis_hash(reported)
         .map_err(|e| format!("node reported an unusable genesis hash: {e}"))?;
 
+    Ok(GenesisInfo {
+        hash: reported,
+        latency,
+    })
+}
+
+/// Decides whether the chain the node serves is the one the caller asked for.
+///
+/// When `expected` is given this is the client's actual authenticity check: a
+/// node on a different chain — or an endpoint that is not the intended one —
+/// reports a different genesis hash and is rejected. When `expected` is `None`
+/// the hash is only reported, which is what you want against a local dev chain
+/// whose genesis varies per chainspec.
+///
+/// # Arguments
+///
+/// * `reported` - The hash the node gave.
+/// * `expected` - The genesis hash the caller requires, if any.
+///
+/// # Returns
+///
+/// Whether the hash was actually checked; `false` means no requirement was
+/// supplied and nothing has been proven. An error if the two differ.
+fn verify_genesis_hash(
+    reported: [u8; 32],
+    expected: Option<&[u8; 32]>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     match expected {
         Some(expected) if reported != *expected => Err(format!(
             "genesis hash mismatch — expected {}, node reports {}",
@@ -180,19 +286,22 @@ async fn check_genesis_hash(
         .into()),
         Some(_) => {
             info!("Genesis hash verified: 0x{}", hex::encode(reported));
-            Ok(())
+            Ok(true)
         }
         None => {
             info!(
                 "Node genesis hash is 0x{} (not verified — pass --genesis-hash to require one)",
                 hex::encode(reported)
             );
-            Ok(())
+            Ok(false)
         }
     }
 }
 
-/// Queries node information from the Substrate node.
+/// Queries node identity and health from the Substrate node.
+///
+/// All four calls are sent before any reply is read, so the node answers them
+/// in parallel and the whole step costs one round trip rather than four.
 ///
 /// # Arguments
 ///
@@ -200,29 +309,40 @@ async fn check_genesis_hash(
 ///
 /// # Returns
 ///
-/// A Result indicating the success or failure of the query.
+/// What the node reported. A call the node refuses leaves its field empty
+/// rather than failing the probe; only a node that stops answering entirely is
+/// an error.
 async fn query_node_info(
     ws_stream: &mut NodeStream,
     timeouts: Timeouts,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<NodeInfo, Box<dyn std::error::Error>> {
     let requests = vec![
         json!({
             "jsonrpc": "2.0",
             "method": "system_name",
             "params": [],
-            "id": 1,
+            "id": ID_NAME,
         }),
         json!({
             "jsonrpc": "2.0",
             "method": "system_chain",
             "params": [],
-            "id": 2,
+            "id": ID_CHAIN,
         }),
         json!({
             "jsonrpc": "2.0",
             "method": "system_version",
             "params": [],
-            "id": 3,
+            "id": ID_VERSION,
+        }),
+        // The one call here that reports a *state* rather than an identity: a
+        // node can be reachable, correctly named, on the right chain, and still
+        // useless because it has no peers or is still syncing.
+        json!({
+            "jsonrpc": "2.0",
+            "method": "system_health",
+            "params": [],
+            "id": ID_HEALTH,
         }),
     ];
 
@@ -238,6 +358,8 @@ async fn query_node_info(
         info!("Sending request: {}", request);
         ws_stream.send(Message::Text(request.to_string())).await?;
     }
+
+    let mut info = NodeInfo::default();
 
     while !pending.is_empty() {
         let text = next_text_frame(ws_stream, timeouts.rpc)
@@ -257,6 +379,7 @@ async fn query_node_info(
                     error!("Error in response for request id {}: {}", id, error);
                 } else {
                     info!("Received response for request id {}: {}", id, response);
+                    record_response(&mut info, id, &response["result"]);
                 }
             }
             Some(id) => error!("Received response for unknown request id {}", id),
@@ -264,7 +387,40 @@ async fn query_node_info(
         }
     }
 
-    Ok(())
+    Ok(info)
+}
+
+/// Files one successful response into `info` under the request it answers.
+///
+/// A result of an unexpected shape is dropped with a log line rather than
+/// failing the run: the node answered, it just answered oddly, and the rest of
+/// the report is still worth having.
+fn record_response(info: &mut NodeInfo, id: u64, result: &serde_json::Value) {
+    let as_text = |value: &serde_json::Value| match value.as_str() {
+        Some(text) => Some(text.to_string()),
+        None => {
+            error!("Response for request id {id} is not a string: {value}");
+            None
+        }
+    };
+
+    match id {
+        ID_NAME => info.name = as_text(result),
+        ID_CHAIN => info.chain = as_text(result),
+        ID_VERSION => info.version = as_text(result),
+        ID_HEALTH => {
+            info.peers = result["peers"].as_u64();
+            info.is_syncing = result["isSyncing"].as_bool();
+            info.should_have_peers = result["shouldHavePeers"].as_bool();
+            info!(
+                "Node health: {} peer(s), syncing={:?}",
+                info.peers
+                    .map_or_else(|| "?".to_string(), |p| p.to_string()),
+                info.is_syncing
+            );
+        }
+        _ => error!("No handler for request id {id}"),
+    }
 }
 
 /// Follows new block headers pushed by the node.
@@ -283,21 +439,18 @@ async fn query_node_info(
 ///
 /// # Returns
 ///
-/// A Result that is an error if the node refuses the subscription or stops
-/// producing blocks.
+/// How many headers were observed, or an error if the node refuses the
+/// subscription or stops producing blocks.
 async fn follow_new_heads(
     ws_stream: &mut NodeStream,
     count: u64,
     timeouts: Timeouts,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const SUBSCRIBE_ID: u64 = 4;
-    const UNSUBSCRIBE_ID: u64 = 5;
-
+) -> Result<u64, Box<dyn std::error::Error>> {
     let request = json!({
         "jsonrpc": "2.0",
         "method": "chain_subscribeNewHeads",
         "params": [],
-        "id": SUBSCRIBE_ID,
+        "id": ID_SUBSCRIBE,
     });
     info!("Subscribing to new heads: {}", request);
     ws_stream.send(Message::Text(request.to_string())).await?;
@@ -308,7 +461,7 @@ async fn follow_new_heads(
     let subscription_id = loop {
         let text = next_text_frame(ws_stream, timeouts.rpc).await?;
         let value: serde_json::Value = serde_json::from_str(&text)?;
-        if value["id"].as_u64() != Some(SUBSCRIBE_ID) {
+        if value["id"].as_u64() != Some(ID_SUBSCRIBE) {
             continue;
         }
         if let Some(error) = value.get("error") {
@@ -354,12 +507,12 @@ async fn follow_new_heads(
         "jsonrpc": "2.0",
         "method": "chain_unsubscribeNewHeads",
         "params": [subscription_id],
-        "id": UNSUBSCRIBE_ID,
+        "id": ID_UNSUBSCRIBE,
     });
     ws_stream.send(Message::Text(request.to_string())).await?;
     info!("Unsubscribed after {seen} header(s)");
 
-    Ok(())
+    Ok(seen)
 }
 
 /// Parses a hex-encoded 32-byte genesis hash.
@@ -403,19 +556,34 @@ struct Opt {
     /// them, then unsubscribe and exit. Omit to exit straight after the query.
     #[arg(long, value_name = "COUNT")]
     follow: Option<u64>,
+
+    /// Print the findings to stdout as a single JSON object. Logs stay on
+    /// stderr, so stdout carries nothing but the report and can be piped
+    /// straight into `jq`.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Connects to the node, verifies its chain identity and queries node info.
 ///
+/// Each step writes what it learned into `report` before the next one runs, so
+/// a failure part-way through still leaves everything gathered up to that point
+/// — which is most of the value when the probe is watching a node that broke.
+///
 /// # Arguments
 ///
 /// * `opt` - The parsed command-line arguments.
+/// * `timeouts` - The network waits to apply.
+/// * `report` - Filled in as the run progresses.
 ///
 /// # Returns
 ///
 /// A Result indicating the success or failure of the run.
-async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
-    let timeouts = Timeouts::default();
+async fn run(
+    opt: &Opt,
+    timeouts: Timeouts,
+    report: &mut ProbeReport,
+) -> Result<(), Box<dyn std::error::Error>> {
     let expected_genesis = opt
         .genesis_hash
         .as_deref()
@@ -435,12 +603,24 @@ async fn run(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to connect to {}: {e}", opt.node_address))?;
     info!("Connected to the node with response: {:?}", response);
 
-    check_genesis_hash(&mut ws_stream, expected_genesis.as_ref(), timeouts).await?;
-    query_node_info(&mut ws_stream, timeouts).await?;
+    // Recorded before the comparison, so a mismatch is reported alongside the
+    // hash that caused it rather than only in the error text.
+    let genesis = fetch_genesis_hash(&mut ws_stream, timeouts).await?;
+    report.genesis_hash = Some(format!("0x{}", hex::encode(genesis.hash)));
+    report.rpc_latency_ms = Some(genesis.latency.as_millis());
+    report.genesis_verified = verify_genesis_hash(genesis.hash, expected_genesis.as_ref())?;
+
+    let info = query_node_info(&mut ws_stream, timeouts).await?;
+    report.name = info.name;
+    report.chain = info.chain;
+    report.version = info.version;
+    report.peers = info.peers;
+    report.is_syncing = info.is_syncing;
+    report.should_have_peers = info.should_have_peers;
     info!("Node information queried!");
 
     if let Some(count) = opt.follow {
-        follow_new_heads(&mut ws_stream, count, timeouts).await?;
+        report.heads_followed = Some(follow_new_heads(&mut ws_stream, count, timeouts).await?);
     }
 
     ws_stream.close(None).await.ok();
@@ -462,7 +642,28 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if let Err(e) = run(Opt::parse()).await {
+    let opt = Opt::parse();
+    let mut report = ProbeReport {
+        endpoint: opt.node_address.clone(),
+        ..Default::default()
+    };
+
+    let result = run(&opt, Timeouts::default(), &mut report).await;
+    match &result {
+        Ok(()) => report.ok = true,
+        Err(e) => report.error = Some(e.to_string()),
+    }
+
+    // Printed on failure too: a probe that emits nothing precisely when the node
+    // is broken is useless to whatever is parsing it.
+    if opt.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => error!("failed to serialise the probe report: {e}"),
+        }
+    }
+
+    if let Err(e) = result {
         error!("{e}");
         std::process::exit(1);
     }
@@ -503,6 +704,17 @@ mod tests {
             rpc: Duration::from_millis(250),
             head: Duration::from_millis(250),
         }
+    }
+
+    /// The genesis step as `run` composes it — fetch, then compare. Lets the
+    /// tests below assert on the whole check rather than on either half.
+    async fn check_genesis_hash(
+        ws_stream: &mut NodeStream,
+        expected: Option<&[u8; 32]>,
+        timeouts: Timeouts,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let genesis = fetch_genesis_hash(ws_stream, timeouts).await?;
+        verify_genesis_hash(genesis.hash, expected)
     }
 
     /// Answers a single `chain_getBlockHash` request with `hash`.
@@ -619,7 +831,7 @@ mod tests {
     async fn serve_new_heads(mut ws: WebSocketStream<TcpStream>, heads: u64) {
         ws.next().await;
         ws.send(Message::Text(
-            r#"{"jsonrpc":"2.0","id":4,"result":"sub-abc"}"#.into(),
+            r#"{"jsonrpc":"2.0","id":5,"result":"sub-abc"}"#.into(),
         ))
         .await
         .unwrap();
@@ -648,7 +860,7 @@ mod tests {
         let mut ws = mock_node(|mut ws| async move {
             ws.next().await;
             ws.send(Message::Text(
-                r#"{"jsonrpc":"2.0","id":4,"result":"sub-abc"}"#.into(),
+                r#"{"jsonrpc":"2.0","id":5,"result":"sub-abc"}"#.into(),
             ))
             .await
             .unwrap();
@@ -678,7 +890,7 @@ mod tests {
         let mut ws = mock_node(|mut ws| async move {
             ws.next().await;
             ws.send(Message::Text(
-                r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"unsafe"}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"unsafe"}}"#.into(),
             ))
             .await
             .unwrap();
@@ -706,12 +918,12 @@ mod tests {
         assert!(err.contains("saw 1 of 3"), "unhelpful error: {err}");
     }
 
-    /// The node hangs up after answering only one of the three requests. The
+    /// The node hangs up after answering only one of the four requests. The
     /// terminated stream must surface an error, not spin on `None` forever.
     #[tokio::test]
     async fn hangup_errors_instead_of_spinning() {
         let mut ws = mock_node(|mut ws| async move {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 ws.next().await;
             }
             ws.send(Message::Text(
@@ -734,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn all_error_responses_still_terminate() {
         let mut ws = mock_node(|mut ws| async move {
-            for id in 1..=3 {
+            for id in 1..=4 {
                 ws.next().await;
                 ws.send(Message::Text(format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32601}}}}"#
@@ -745,9 +957,140 @@ mod tests {
         })
         .await;
 
-        assert!(
-            query_node_info(&mut ws, fast()).await.is_ok(),
-            "errored responses are still responses"
+        let info = query_node_info(&mut ws, fast())
+            .await
+            .expect("errored responses are still responses");
+        assert_eq!(info, NodeInfo::default(), "nothing was actually reported");
+    }
+
+    /// Answers all four identity/health calls, keyed by request id so the
+    /// out-of-order case the client is built for is exercised (health first).
+    async fn serve_node_info(mut ws: WebSocketStream<TcpStream>, health: &str) {
+        let replies = [
+            (ID_HEALTH, health.to_string()),
+            (ID_VERSION, r#""1.24.0""#.to_string()),
+            (ID_NAME, r#""Parity Polkadot""#.to_string()),
+            (ID_CHAIN, r#""Polkadot""#.to_string()),
+        ];
+        for _ in 0..replies.len() {
+            ws.next().await;
+        }
+        for (id, result) in replies {
+            ws.send(Message::Text(format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#
+            )))
+            .await
+            .unwrap();
+        }
+        ws.next().await;
+    }
+
+    #[tokio::test]
+    async fn query_reports_identity_and_health() {
+        let mut ws = mock_node(|ws| {
+            serve_node_info(
+                ws,
+                r#"{"peers":42,"isSyncing":false,"shouldHavePeers":true}"#,
+            )
+        })
+        .await;
+
+        let info = query_node_info(&mut ws, fast()).await.unwrap();
+        assert_eq!(
+            info,
+            NodeInfo {
+                name: Some("Parity Polkadot".into()),
+                chain: Some("Polkadot".into()),
+                version: Some("1.24.0".into()),
+                peers: Some(42),
+                is_syncing: Some(false),
+                should_have_peers: Some(true),
+            }
         );
+    }
+
+    /// `system_health` is not exposed everywhere. A node that refuses it is
+    /// still worth reporting on, so the refusal must cost only that field.
+    #[tokio::test]
+    async fn refused_health_call_leaves_identity_intact() {
+        let mut ws = mock_node(|mut ws| async move {
+            for _ in 0..4 {
+                ws.next().await;
+            }
+            for (id, body) in [
+                (ID_NAME, r#""result":"Parity Polkadot""#),
+                (ID_CHAIN, r#""result":"Polkadot""#),
+                (ID_VERSION, r#""result":"1.24.0""#),
+                (ID_HEALTH, r#""error":{"code":-32601}"#),
+            ] {
+                ws.send(Message::Text(format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},{body}}}"#
+                )))
+                .await
+                .unwrap();
+            }
+            ws.next().await;
+        })
+        .await;
+
+        let info = query_node_info(&mut ws, fast()).await.unwrap();
+        assert_eq!(info.chain.as_deref(), Some("Polkadot"), "identity survived");
+        assert_eq!(info.peers, None, "a refused call reports nothing");
+        assert_eq!(info.is_syncing, None);
+    }
+
+    /// A health result missing fields must not be read as zero peers — "the
+    /// node did not say" and "the node has no peers" mean opposite things.
+    #[tokio::test]
+    async fn partial_health_result_does_not_invent_values() {
+        let mut ws = mock_node(|ws| serve_node_info(ws, r#"{"isSyncing":true}"#)).await;
+
+        let info = query_node_info(&mut ws, fast()).await.unwrap();
+        assert_eq!(info.is_syncing, Some(true));
+        assert_eq!(info.peers, None, "absent must not become 0");
+        assert_eq!(info.should_have_peers, None);
+    }
+
+    /// The JSON shape is this tool's machine-facing contract, so pin it: absent
+    /// findings are omitted rather than null, and `ok` is always present.
+    #[test]
+    fn json_report_omits_what_the_node_did_not_answer() {
+        let report = ProbeReport {
+            endpoint: "ws://127.0.0.1:9944".into(),
+            ok: true,
+            genesis_hash: Some("0xdead".into()),
+            genesis_verified: true,
+            peers: Some(3),
+            ..Default::default()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["peers"], 3);
+        assert_eq!(json["genesis_verified"], true);
+        assert!(json.get("error").is_none(), "no error key on success");
+        assert!(
+            json.get("chain").is_none(),
+            "an unanswered field must be omitted, not null"
+        );
+    }
+
+    /// A failed run must still produce a report, or whatever is parsing stdout
+    /// gets nothing exactly when the node is broken.
+    #[test]
+    fn json_report_carries_the_failure() {
+        let report = ProbeReport {
+            endpoint: "ws://127.0.0.1:9944".into(),
+            ok: false,
+            error: Some("genesis hash mismatch".into()),
+            ..Default::default()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"], "genesis hash mismatch");
+        assert_eq!(json["endpoint"], "ws://127.0.0.1:9944");
     }
 }

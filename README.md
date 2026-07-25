@@ -1,6 +1,6 @@
 # substrate-node-probe
 
-A small Rust client that connects to a [Substrate](https://substrate.io) node over WebSocket, verifies which chain the node is actually serving, queries its identity over JSON-RPC, and can follow new blocks as they are produced.
+A small Rust client that connects to a [Substrate](https://substrate.io) node over WebSocket, verifies which chain the node is actually serving, reports its identity and health over JSON-RPC, and can follow new blocks as they are produced.
 
 > Previously `substrate_handshake`. The old URL redirects.
 
@@ -13,6 +13,7 @@ INFO  Genesis hash verified: 0x91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49
 INFO  Received response for request id 1: {"id":1,"jsonrpc":"2.0","result":"Parity Polkadot"}
 INFO  Received response for request id 2: {"id":2,"jsonrpc":"2.0","result":"Polkadot"}
 INFO  Received response for request id 3: {"id":3,"jsonrpc":"2.0","result":"1.24.0-660acefe665"}
+INFO  Node health: 65 peer(s), syncing=Some(false)
 INFO  Node information queried!
 ```
 
@@ -20,9 +21,38 @@ INFO  Node information queried!
 
 1. **Connects** to the node's JSON-RPC endpoint over WebSocket (`ws://` or `wss://`).
 2. **Checks chain identity** by asking for the hash of block 0 via `chain_getBlockHash` and comparing it to the `--genesis-hash` you supplied. A node on a different chain is rejected and the client exits non-zero without querying anything further.
-3. **Queries node information** — `system_name`, `system_chain` and `system_version` — matching each response to its request by JSON-RPC id, since nodes are free to answer out of order (and do).
+3. **Queries node information** — `system_name`, `system_chain`, `system_version` and `system_health` — matching each response to its request by JSON-RPC id, since nodes are free to answer out of order (and do). All four go out before any reply is read, so the step costs one round trip rather than four.
 4. **Follows new blocks**, optionally — with `--follow N` it subscribes via `chain_subscribeNewHeads`, reports headers as the node pushes them, then unsubscribes.
-5. **Logs** every step through `env_logger`, so `RUST_LOG=debug` shows the full exchange.
+5. **Reports**, either as logs through `env_logger` (`RUST_LOG=debug` shows the full exchange) or as a single JSON object with `--json`.
+
+### Machine-readable output
+
+`--json` prints one object to stdout. Logging stays on stderr, so stdout carries nothing but the report:
+
+```
+$ substrate-node-probe --node-address wss://rpc.polkadot.io --follow 2 --json 2>/dev/null
+{
+  "endpoint": "wss://rpc.polkadot.io",
+  "ok": true,
+  "genesis_hash": "0x91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3",
+  "genesis_verified": true,
+  "rpc_latency_ms": 63,
+  "name": "Parity Polkadot",
+  "chain": "Polkadot",
+  "version": "1.24.0-660acefe665",
+  "peers": 65,
+  "is_syncing": false,
+  "should_have_peers": true,
+  "heads_followed": 2
+}
+```
+
+Two properties worth relying on:
+
+- **A failed run still prints a report** — `"ok": false` with an `error`, plus whatever was gathered before the failure. A probe that goes silent exactly when the node breaks is no use to whatever is parsing it. A genesis mismatch, for instance, still reports the hash the node actually serves, so you needn't parse it back out of the error string.
+- **Fields the node did not answer are omitted, not `null`** — `"peers": 0` means an isolated node; a missing `peers` means the node never said. `system_health` is not exposed everywhere, and a refusal costs only its own fields rather than the whole report.
+
+`genesis_verified` is `true` only when `--genesis-hash` was supplied *and* matched; without the flag the hash is reported but nothing about it is proven. `should_have_peers` is what makes `peers: 0` interpretable — it is `false` on a dev chain running alone.
 
 ### Why WebSocket
 
@@ -60,8 +90,14 @@ cargo run -- [--node-address <url>] [--genesis-hash <hex>]
 | `--node-address` | `ws://127.0.0.1:9944` | WebSocket RPC endpoint. `wss://` is supported. |
 | `--genesis-hash` | *(none)* | Hash the node must report, with or without a `0x` prefix. Omit to report the node's genesis hash without enforcing one. |
 | `--follow <COUNT>` | *(none)* | Follow this many new block headers after querying, then unsubscribe and exit. Omit to exit straight after the query. |
+| `--json` | *(off)* | Print the findings to stdout as one JSON object. Logs stay on stderr. |
 
-Exit code is `0` on success and `1` on any failure, including a genesis mismatch, so it is usable as a health check in scripts.
+Exit code is `0` on success and `1` on any failure, including a genesis mismatch, so it is usable as a health check in scripts:
+
+```bash
+substrate-node-probe --node-address wss://rpc.polkadot.io --json 2>/dev/null \
+  | jq -e '.ok and .peers > 0 and (.is_syncing | not)'
+```
 
 ### Public endpoints
 
