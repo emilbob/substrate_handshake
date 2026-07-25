@@ -104,15 +104,19 @@ The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE enc
 
 ## Try it in a browser
 
-[`web/index.html`](web/index.html) runs the same checks against a live node from a browser, with the results filling in as they resolve. It is a **JavaScript reimplementation**, not this binary — a browser cannot execute a Rust program — but it speaks the same JSON-RPC, uses the same request ids and failure kinds, and applies the same rule that an unprovable requirement fails rather than passes.
+**→ [emilbob.github.io/substrate-node-probe](https://emilbob.github.io/substrate-node-probe/)**
 
-It is a single self-contained file with no build step:
+The same checks against a live node, with results filling in as they resolve. It is a **JavaScript reimplementation**, not this binary — a browser cannot execute a Rust program — but it speaks the same JSON-RPC, uses the same request ids and failure kinds, and applies the same rule that an unprovable requirement fails rather than passes. Connections go straight from your browser to the node you name; nothing is proxied.
+
+Source is [`web/index.html`](web/index.html), one self-contained file with no build step. To run it locally:
 
 ```bash
 python3 -m http.server -d web 8000    # then open http://127.0.0.1:8000
 ```
 
-To publish it, point GitHub Pages at the `web/` directory, or drop the file on any static host. Note that a page served over `https` cannot open a `ws://` connection to `127.0.0.1` — browsers block that as mixed content — so probing a local dev node means opening the file from disk, or using the CLI.
+Deployed by [`pages.yml`](.github/workflows/pages.yml) on any push that touches `web/`.
+
+A page served over `https` cannot open a `ws://` connection to `127.0.0.1` — browsers block that as mixed content — so probing a **local dev node** means running the page from disk or `http://127.0.0.1`, or just using the CLI, which has no such restriction.
 
 ## Layout
 
