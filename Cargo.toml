@@ -1,10 +1,10 @@
 [package]
-name = "substrate_handshake"
+name = "substrate-node-probe"
 version = "0.1.0"
 edition = "2021"
 description = "Connects to a Substrate node over WebSocket, verifies which chain it serves, and queries its identity over JSON-RPC."
 license = "MIT"
-repository = "https://github.com/emilbob/substrate_handshake"
+repository = "https://github.com/emilbob/substrate-node-probe"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

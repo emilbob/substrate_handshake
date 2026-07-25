@@ -387,7 +387,7 @@ fn parse_genesis_hash(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Err
 /// Connect to a Substrate node, verify which chain it serves, and query its
 /// identity over JSON-RPC.
 #[derive(Parser, Debug)]
-#[command(name = "substrate_handshake", version)]
+#[command(name = "substrate-node-probe", version)]
 struct Opt {
     /// Node address to connect to
     #[arg(long, default_value = "ws://127.0.0.1:9944")]

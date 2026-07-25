@@ -1,9 +1,11 @@
-# substrate_handshake
+# substrate-node-probe
 
-A small Rust client that connects to a [Substrate](https://substrate.io) node over WebSocket, verifies which chain the node is actually serving, and queries its identity over JSON-RPC.
+A small Rust client that connects to a [Substrate](https://substrate.io) node over WebSocket, verifies which chain the node is actually serving, queries its identity over JSON-RPC, and can follow new blocks as they are produced.
+
+> Previously `substrate_handshake`. The old URL redirects.
 
 ```
-$ cargo run -- --node-address wss://rpc.polkadot.io \
+$ substrate-node-probe --node-address wss://rpc.polkadot.io \
                --genesis-hash 91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3
 
 INFO  Connecting to node at wss://rpc.polkadot.io
@@ -27,7 +29,7 @@ INFO  Node information queried!
 Steps 1–3 don't need it — request/response would work as well over HTTP POST. `--follow` is the part that does: a subscription has the node push frames unprompted for as long as the connection lives, which is what the transport is actually for.
 
 ```
-$ cargo run -- --node-address wss://rpc.polkadot.io --follow 3
+$ substrate-node-probe --node-address wss://rpc.polkadot.io --follow 3
 
 INFO  Subscribed with id JfjLVdZ5TGesJIVX
 INFO  New head #32263282 parent=0xb2ddbc8a89c37c57b07136cf2c997c8074b0c7de309f19eae00a990c2e3bfe8c
@@ -36,11 +38,11 @@ INFO  New head #32263284 parent=0x0e0c80ba8389731ff05c28a2810a3093d018216b12bbe2
 INFO  Unsubscribed after 3 header(s)
 ```
 
-### What it is not
+### Scope
 
-This does **not** perform a Substrate peer-to-peer handshake. That is a libp2p protocol on the node's p2p port (30333 by default) and requires Noise encryption, multistream-select and yamux to reach — effectively a re-implementation of part of `sc-network`. What this client does instead is verify chain identity over the RPC endpoint, which is a genuine check but a different and weaker one: it confirms *which chain* you are talking to, not that the peer is an authenticated validator.
+This talks to a node's **RPC endpoint**, not its peer-to-peer port. Verifying the genesis hash confirms *which chain* you are connected to; it is not peer authentication, which is a libp2p protocol on port 30333 requiring Noise, multistream-select and yamux.
 
-The `HandshakeMessage` struct in `src/main.rs` is kept as a worked example of SCALE encoding — Substrate's wire codec — with a round-trip test. It is deliberately not sent to the node, because an RPC endpoint has no notion of it.
+The `HandshakeMessage` struct in `src/main.rs` is a worked example of SCALE encoding — Substrate's wire codec — kept with a round-trip test. It is deliberately not sent to the node, because an RPC endpoint has no notion of it.
 
 ## Requirements
 
@@ -104,7 +106,7 @@ cargo clippy --all-targets      # lints
 cargo fmt --check               # formatting
 ```
 
-Tests run against an in-process mock WebSocket node, so they need no network and no running Substrate node. Timeout behaviour is tested with tokio's virtual time, so the suite finishes in milliseconds rather than waiting out real timeouts.
+Tests run against an in-process mock WebSocket node, so they need no network and no running Substrate node. Timeouts are injectable, so the timeout paths are covered with short real durations and the whole suite finishes in well under a second.
 
 ## Notes
 
