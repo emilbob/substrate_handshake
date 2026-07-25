@@ -6,10 +6,12 @@
 
 use futures_util::StreamExt;
 use log::info;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+use crate::error::ProbeError;
 
 /// The client's end of the WebSocket connection to the node.
 pub(crate) type NodeStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -24,22 +26,26 @@ pub(crate) const ID_VERSION: u64 = 3;
 pub(crate) const ID_HEALTH: u64 = 4;
 pub(crate) const ID_SUBSCRIBE: u64 = 5;
 pub(crate) const ID_UNSUBSCRIBE: u64 = 6;
+pub(crate) const ID_HEADER: u64 = 7;
 
-/// How long to wait for the WebSocket connection to be established.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default wait for the WebSocket connection to be established.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait for any single response frame from the node. Without this a
-/// node that accepts the socket and then goes quiet would hang the client.
-const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default wait for a node to answer a request. Without a bound, a node that
+/// accepts the socket and then goes quiet would hang the client.
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait for a pushed block header. Deliberately far longer than
+/// Default wait for a pushed block header. Deliberately far longer than
 /// `RPC_TIMEOUT`: this waits on the chain's block time, not on the node being
 /// responsive. Polkadot targets ~6s, but parachains and dev chains vary widely.
-const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The network waits, grouped so they can be shortened in tests.
+/// The network waits, grouped so they can be shortened in tests and overridden
+/// from the command line.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timeouts {
+    /// Waiting for the connection to be established.
+    pub(crate) connect: Duration,
     /// Waiting for the node to answer a request.
     pub(crate) rpc: Duration,
     /// Waiting for the chain to produce a block.
@@ -49,31 +55,75 @@ pub(crate) struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
+            connect: CONNECT_TIMEOUT,
             rpc: RPC_TIMEOUT,
             head: SUBSCRIPTION_TIMEOUT,
         }
     }
 }
 
-/// Opens a WebSocket connection to the node.
+/// A budget for a whole operation, rather than for one frame of it.
 ///
-/// Bounded by `CONNECT_TIMEOUT`, so an address that accepts TCP but never
-/// completes the WebSocket handshake fails rather than hanging.
+/// The distinction matters because the read loops skip frames they do not
+/// recognise. Bounding each individual read would let a node that emits one
+/// unrelated frame just inside the limit keep the probe waiting forever — every
+/// single wait short, the total unbounded. A deadline is set once when the
+/// operation starts and every read inside it draws down the same clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    at: Instant,
+    /// The budget it was created with, kept only so timeout messages can name
+    /// the limit the caller actually set.
+    budget: Duration,
+}
+
+impl Deadline {
+    /// Starts a budget of `budget` from now.
+    pub(crate) fn after(budget: Duration) -> Self {
+        Deadline {
+            at: Instant::now() + budget,
+            budget,
+        }
+    }
+
+    /// How much of the budget is left, or a timeout error if none is.
+    pub(crate) fn remaining(&self) -> Result<Duration, ProbeError> {
+        self.at
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| self.expired())
+    }
+
+    /// The error to report when this budget runs out.
+    pub(crate) fn expired(&self) -> ProbeError {
+        ProbeError::timeout(format!(
+            "node sent no usable response within {:?}",
+            self.budget
+        ))
+    }
+}
+
+/// Opens a WebSocket connection to the node.
 ///
 /// # Arguments
 ///
 /// * `address` - The node's endpoint, `ws://` or `wss://`.
+/// * `timeout` - How long to allow for the connection to be established.
 ///
 /// # Returns
 ///
 /// The open connection, or an error naming the address that failed.
-pub(crate) async fn connect(address: &str) -> Result<NodeStream, Box<dyn std::error::Error>> {
+pub(crate) async fn connect(address: &str, timeout: Duration) -> Result<NodeStream, ProbeError> {
     info!("Connecting to node at {address}");
 
-    let (ws_stream, response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(address))
+    let (ws_stream, response) = tokio::time::timeout(timeout, connect_async(address))
         .await
-        .map_err(|_| format!("timed out connecting to {address} after {CONNECT_TIMEOUT:?}"))?
-        .map_err(|e| format!("failed to connect to {address}: {e}"))?;
+        .map_err(|_| {
+            ProbeError::timeout(format!(
+                "timed out connecting to {address} after {timeout:?}"
+            ))
+        })?
+        .map_err(|e| ProbeError::connect(format!("failed to connect to {address}: {e}")))?;
 
     info!("Connected to the node with response: {response:?}");
     Ok(ws_stream)
@@ -83,30 +133,32 @@ pub(crate) async fn connect(address: &str) -> Result<NodeStream, Box<dyn std::er
 ///
 /// Non-text frames (ping/pong/binary) are skipped rather than treated as
 /// responses. A closed connection or a silent node becomes an error instead of
-/// an indefinite wait.
+/// an indefinite wait, bounded by `deadline` — which the caller shares across
+/// every read in one operation, so skipped frames cannot extend it.
 ///
 /// # Arguments
 ///
 /// * `ws_stream` - The connection to read from.
-/// * `timeout` - How long to wait. Answering a request and producing a block
-///   are different waits, so the caller chooses.
+/// * `deadline` - The remaining budget for the operation this read belongs to.
 ///
 /// # Returns
 ///
 /// The body of the next text frame.
 pub(crate) async fn next_text_frame(
     ws_stream: &mut NodeStream,
-    timeout: Duration,
-) -> Result<String, Box<dyn std::error::Error>> {
+    deadline: Deadline,
+) -> Result<String, ProbeError> {
     loop {
-        let msg = tokio::time::timeout(timeout, ws_stream.next())
+        let msg = tokio::time::timeout(deadline.remaining()?, ws_stream.next())
             .await
-            .map_err(|_| format!("node sent no response within {timeout:?}"))?
-            .ok_or("connection closed by the node")??;
+            .map_err(|_| deadline.expired())?
+            .ok_or_else(|| ProbeError::transport("connection closed by the node"))??;
 
         match msg {
             Message::Text(text) => return Ok(text),
-            Message::Close(_) => return Err("connection closed by the node".into()),
+            Message::Close(_) => {
+                return Err(ProbeError::transport("connection closed by the node"))
+            }
             _ => continue,
         }
     }

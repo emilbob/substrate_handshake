@@ -39,6 +39,7 @@ where
 /// while the mock's reply is still in flight, and the test fails at random.
 pub(crate) fn fast() -> Timeouts {
     Timeouts {
+        connect: Duration::from_millis(250),
         rpc: Duration::from_millis(250),
         head: Duration::from_millis(250),
     }

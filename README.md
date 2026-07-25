@@ -21,7 +21,7 @@ INFO  Node information queried!
 
 1. **Connects** to the node's JSON-RPC endpoint over WebSocket (`ws://` or `wss://`).
 2. **Checks chain identity** by asking for the hash of block 0 via `chain_getBlockHash` and comparing it to the `--genesis-hash` you supplied. A node on a different chain is rejected and the client exits non-zero without querying anything further.
-3. **Queries node information** — `system_name`, `system_chain`, `system_version` and `system_health` — matching each response to its request by JSON-RPC id, since nodes are free to answer out of order (and do). All four go out before any reply is read, so the step costs one round trip rather than four.
+3. **Queries node information** — `system_name`, `system_chain`, `system_version`, `system_health` and `chain_getHeader` — matching each response to its request by JSON-RPC id, since nodes are free to answer out of order (and do). All five go out before any reply is read, so the step costs one round trip rather than five.
 4. **Follows new blocks**, optionally — with `--follow N` it subscribes via `chain_subscribeNewHeads`, reports headers as the node pushes them, then unsubscribes.
 5. **Reports**, either as logs through `env_logger` (`RUST_LOG=debug` shows the full exchange) or as a single JSON object with `--json`.
 
@@ -36,23 +36,51 @@ $ substrate-node-probe --node-address wss://rpc.polkadot.io --follow 2 --json 2>
   "ok": true,
   "genesis_hash": "0x91b171bb158e2d3848fa23a9f1c25182fb8e20313b2c1eb49219da7a70ce90c3",
   "genesis_verified": true,
-  "rpc_latency_ms": 63,
+  "rpc_latency_ms": 58,
   "name": "Parity Polkadot",
   "chain": "Polkadot",
   "version": "1.24.0-660acefe665",
-  "peers": 65,
+  "peers": 69,
   "is_syncing": false,
   "should_have_peers": true,
+  "best_block": 32264078,
   "heads_followed": 2
 }
 ```
 
-Two properties worth relying on:
+Three properties worth relying on:
 
-- **A failed run still prints a report** — `"ok": false` with an `error`, plus whatever was gathered before the failure. A probe that goes silent exactly when the node breaks is no use to whatever is parsing it. A genesis mismatch, for instance, still reports the hash the node actually serves, so you needn't parse it back out of the error string.
+- **A failed run still prints a report** — `"ok": false` with a `failure` and an `error`, plus whatever was gathered before the failure. A probe that goes silent exactly when the node breaks is no use to whatever is parsing it. A genesis mismatch, for instance, still reports the hash the node actually serves.
 - **Fields the node did not answer are omitted, not `null`** — `"peers": 0` means an isolated node; a missing `peers` means the node never said. `system_health` is not exposed everywhere, and a refusal costs only its own fields rather than the whole report.
+- **Nothing requires parsing prose.** The `error` string is for humans and is free to be reworded; `failure` is the part that is safe to alert on.
 
-`genesis_verified` is `true` only when `--genesis-hash` was supplied *and* matched; without the flag the hash is reported but nothing about it is proven. `should_have_peers` is what makes `peers: 0` interpretable — it is `false` on a dev chain running alone.
+`genesis_verified` is `true` only when `--genesis-hash` was supplied *and* matched; without the flag the hash is reported but nothing about it is proven. `should_have_peers` is what makes `peers: 0` interpretable — it is `false` on a dev chain running alone. `best_block` is the node's current height, which is how you tell a stuck node from a healthy one; the probe reports it but cannot judge staleness on its own, because a Substrate header carries no timestamp — compare it across runs, or against a second node.
+
+### Failure kinds
+
+On failure, `failure` carries one of these. They are a stable contract; the prose in `error` is not.
+
+| `failure` | Meaning |
+| --- | --- |
+| `config` | The command line asked for something impossible. The node is blameless. |
+| `connect` | The connection was never established. |
+| `timeout` | A wait expired. The node may be up but is not answering in time. |
+| `transport` | The connection failed or closed part-way through. |
+| `protocol` | The node answered with something unusable — bad JSON, or a result of the wrong shape. |
+| `rpc_error` | The node returned a JSON-RPC error for a call the probe needs. |
+| `genesis_mismatch` | The node is serving a different chain than you required. |
+| `requirement_unmet` | The node is reachable and correct, but failed a `--require-*` bar. |
+
+The distinction that motivates this: `connect` and `requirement_unmet` are both "the probe exited 1", but one means your monitoring cannot see the node and the other means the node is up and telling you it is unhealthy. Those usually want different alerts.
+
+```bash
+case "$(substrate-node-probe --node-address "$RPC" --require-peers 1 --json 2>/dev/null | jq -r '.failure // "ok"')" in
+  ok)                page=none ;;
+  requirement_unmet) page=degraded ;;
+  connect|timeout)   page=unreachable ;;
+  *)                 page=investigate ;;
+esac
+```
 
 ### Why WebSocket
 
@@ -80,8 +108,9 @@ The `HandshakeMessage` struct in `src/scale.rs` is a worked example of SCALE enc
 | --- | --- |
 | `src/main.rs` | The CLI flags, and the order the steps run in. |
 | `src/rpc.rs` | The transport: opening the WebSocket, request ids, timeouts, reading frames. Knows nothing about chains. |
-| `src/probe.rs` | The JSON-RPC calls — genesis hash, identity and health, following heads. |
+| `src/probe.rs` | The JSON-RPC calls — genesis hash, identity, health and height, following heads. |
 | `src/report.rs` | The findings, their JSON shape, and the `--require-*` checks. |
+| `src/error.rs` | The failure taxonomy. |
 | `src/scale.rs` | The SCALE codec example. |
 
 ## Requirements
@@ -103,6 +132,9 @@ cargo run -- [--node-address <url>] [--genesis-hash <hex>]
 | `--require-peers <N>` | *(none)* | Fail unless the node reports at least `N` connected peers. |
 | `--require-synced` | *(off)* | Fail if the node is still syncing. |
 | `--json` | *(off)* | Print the findings to stdout as one JSON object. Logs stay on stderr. |
+| `--connect-timeout <SECS>` | `10` | Seconds to allow for the connection. |
+| `--rpc-timeout <SECS>` | `10` | Seconds to allow the node to answer a request. |
+| `--head-timeout <SECS>` | `120` | Seconds to allow for each pushed header under `--follow`. Raise it for a slow parachain. |
 
 Exit code is `0` on success and `1` on any failure, so it works as a health check directly:
 
@@ -179,4 +211,4 @@ It is excluded from `cargo test` and never runs on a pull request, because it de
 ## Notes
 
 - TLS uses `rustls` with the `ring` provider, so the build needs no OpenSSL system libraries.
-- Both the connect and per-response paths are bounded by a 10-second timeout; a node that accepts the socket and goes silent produces an error rather than a hang. Waiting for a pushed block header uses a separate, much longer bound (120s), since that waits on the chain's block time rather than on the node being responsive.
+- Every wait is bounded, so a node that accepts the socket and goes silent produces an error rather than a hang. The bounds apply to a **step as a whole**, not to each frame within it: the read loops skip frames they do not recognise, and a per-frame clock would let a node emitting one unrelated frame just inside the limit keep the probe waiting forever — every individual wait short, the total unbounded. Waiting for a pushed block header gets a fresh budget per header, since that waits on the chain's block time rather than on the node being responsive.

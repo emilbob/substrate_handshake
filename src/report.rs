@@ -3,6 +3,8 @@
 use log::info;
 use serde::Serialize;
 
+use crate::error::{Failure, ProbeError};
+
 /// Everything the probe learned about the node, and the exact shape `--json`
 /// prints to stdout.
 ///
@@ -16,6 +18,11 @@ pub(crate) struct ProbeReport {
     pub(crate) endpoint: String,
     /// Whether every step succeeded. `false` means `error` is set.
     pub(crate) ok: bool,
+    /// What kind of thing went wrong, for a consumer that needs to branch.
+    /// `error` below says the same thing in prose and is free to be reworded;
+    /// this is the part that is safe to alert on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure: Option<Failure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
     /// The genesis hash the node reported, `0x`-prefixed.
@@ -44,6 +51,11 @@ pub(crate) struct ProbeReport {
     /// alarming when this is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) should_have_peers: Option<bool>,
+    /// The node's best block number. Compare it across runs, or against another
+    /// node, to tell a stuck node from a healthy one — the header carries no
+    /// timestamp, so the probe cannot judge staleness on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) best_block: Option<u64>,
     /// How many headers `--follow` observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) heads_followed: Option<u64>,
@@ -73,19 +85,21 @@ pub(crate) fn check_requirements(
     report: &ProbeReport,
     min_peers: Option<u64>,
     require_synced: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), ProbeError> {
+    let unmet = |message: String| ProbeError::new(Failure::RequirementUnmet, message);
+
     if let Some(min) = min_peers {
         match report.peers {
             Some(peers) if peers < min => {
-                return Err(
-                    format!("node has {peers} peer(s), --require-peers demands {min}").into(),
-                )
+                return Err(unmet(format!(
+                    "node has {peers} peer(s), --require-peers demands {min}"
+                )))
             }
             None => {
-                return Err(
+                return Err(unmet(
                     "node did not report a peer count, so --require-peers cannot be satisfied"
                         .into(),
-                )
+                ))
             }
             Some(peers) => info!("Peer requirement met: {peers} >= {min}"),
         }
@@ -93,12 +107,12 @@ pub(crate) fn check_requirements(
 
     if require_synced {
         match report.is_syncing {
-            Some(true) => return Err("node is still syncing".into()),
+            Some(true) => return Err(unmet("node is still syncing".into())),
             None => {
-                return Err(
+                return Err(unmet(
                     "node did not report its sync state, so --require-synced cannot be satisfied"
                         .into(),
-                )
+                ))
             }
             Some(false) => info!("Sync requirement met: node is not syncing"),
         }
@@ -135,9 +149,16 @@ mod tests {
     fn peer_requirement_rejects_an_isolated_node() {
         let report = report_with_health(Some(0), Some(false));
         let err = check_requirements(&report, Some(1), false)
-            .expect_err("a node with no peers must not pass")
-            .to_string();
-        assert!(err.contains("0 peer(s)"), "unhelpful error: {err}");
+            .expect_err("a node with no peers must not pass");
+        assert_eq!(
+            err.kind(),
+            Failure::RequirementUnmet,
+            "a reachable node that fails a bar is not a connection problem"
+        );
+        assert!(
+            err.to_string().contains("0 peer(s)"),
+            "unhelpful error: {err}"
+        );
     }
 
     /// The trap this whole flag exists to avoid: a node that will not say how
@@ -196,20 +217,59 @@ mod tests {
     }
 
     /// A failed run must still produce a report, or whatever is parsing stdout
-    /// gets nothing exactly when the node is broken.
+    /// gets nothing exactly when the node is broken. The classification is the
+    /// part a monitor branches on, so it has to be there and it has to be
+    /// stable — never make a consumer regex the prose.
     #[test]
     fn json_report_carries_the_failure() {
         let report = ProbeReport {
             endpoint: "ws://127.0.0.1:9944".into(),
             ok: false,
-            error: Some("genesis hash mismatch".into()),
+            failure: Some(Failure::GenesisMismatch),
+            error: Some("genesis hash mismatch — expected …".into()),
             ..Default::default()
         };
 
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
         assert_eq!(json["ok"], false);
-        assert_eq!(json["error"], "genesis hash mismatch");
+        assert_eq!(json["failure"], "genesis_mismatch");
         assert_eq!(json["endpoint"], "ws://127.0.0.1:9944");
+        assert!(json["error"].is_string());
+    }
+
+    /// The names are the machine-facing contract — renaming a variant silently
+    /// breaks every alert built on it, so pin the wire strings.
+    #[test]
+    fn failure_kinds_serialise_to_stable_names() {
+        let cases = [
+            (Failure::Config, "config"),
+            (Failure::Connect, "connect"),
+            (Failure::Timeout, "timeout"),
+            (Failure::Transport, "transport"),
+            (Failure::Protocol, "protocol"),
+            (Failure::RpcError, "rpc_error"),
+            (Failure::GenesisMismatch, "genesis_mismatch"),
+            (Failure::RequirementUnmet, "requirement_unmet"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(serde_json::to_value(kind).unwrap(), expected);
+        }
+    }
+
+    /// A clean run must not carry a failure key at all.
+    #[test]
+    fn a_successful_report_has_no_failure() {
+        let report = ProbeReport {
+            ok: true,
+            best_block: Some(32_263_282),
+            ..Default::default()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert!(json.get("failure").is_none());
+        assert!(json.get("error").is_none());
+        assert_eq!(json["best_block"], 32_263_282u64);
     }
 }
