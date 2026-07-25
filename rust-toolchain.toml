@@ -1,0 +1,10 @@
+# Pins the channel and guarantees rustfmt/clippy are present, so `cargo fmt`
+# and `cargo clippy` behave the same locally as in CI.
+#
+# Deliberately `stable` rather than an exact version: this is a small client
+# with no nightly or MSRV constraints, and Dependabot cannot bump a pinned
+# toolchain, so an exact pin here would go stale unnoticed the same way
+# structopt and env_logger did.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
