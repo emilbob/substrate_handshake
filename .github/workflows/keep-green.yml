@@ -19,12 +19,12 @@ jobs:
 
       # Only pay for the Node toolchain in repos that actually have one; this
       # workflow is shared with JS projects, so the step stays, just guarded.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: hashFiles('package.json') != ''
         with:
           node-version: 22
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         if: hashFiles('**/Cargo.lock') != ''
         with:
           path: |
